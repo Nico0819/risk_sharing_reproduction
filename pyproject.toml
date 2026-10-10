@@ -3,5 +3,5 @@ name = "agentsociety-project"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "agentsociety2==2.8.3",
+    "agentsociety2==2.9.0",
 ]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import random
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -24,6 +25,37 @@ from protocol import paper_spec as spec
 
 
 AgentId = Hashable
+
+
+PARTICIPANT_DECISION_PREFIX = "RISK_SHARING_PARTICIPANT_DECISION:"
+
+
+def parse_participant_decision(instruction: str) -> dict[str, Any] | None:
+    """Decode the structured decision emitted by a participant model."""
+
+    if not isinstance(instruction, str) or not instruction.startswith(
+        PARTICIPANT_DECISION_PREFIX
+    ):
+        return None
+    raw = instruction[len(PARTICIPANT_DECISION_PREFIX) :].strip()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("participant decision envelope is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("participant decision envelope must be a JSON object")
+    required = {"decision_type", "decision_id", "amount"}
+    if required.difference(payload):
+        raise ValueError(
+            "participant decision must contain decision_type, decision_id, and amount"
+        )
+    if not isinstance(payload["decision_type"], str):
+        raise ValueError("participant decision_type must be a string")
+    if not isinstance(payload["decision_id"], str):
+        raise ValueError("participant decision_id must be a string")
+    if type(payload["amount"]) is not int:
+        raise ValueError("participant amount must be a strict integer")
+    return payload
 
 
 _PARTICIPANT_HISTORY_FIELDS = (
@@ -141,6 +173,15 @@ class RiskSharingEnv(EnvBase):
         self._trusted_caller: ContextVar[AgentId | None] = ContextVar(
             f"risk_sharing_caller_{id(self)}", default=None
         )
+        self._expected_participant_decision: ContextVar[
+            tuple[str, str, int] | None
+        ] = ContextVar(
+            f"risk_sharing_expected_decision_{id(self)}", default=None
+        )
+        self._router_requires_participant_decision: ContextVar[bool] = ContextVar(
+            f"risk_sharing_router_requires_participant_{id(self)}", default=False
+        )
+        self.participant_decisions: list[dict[str, Any]] = []
         self._prepare_period()
 
     @staticmethod
@@ -187,6 +228,56 @@ class RiskSharingEnv(EnvBase):
             yield
         finally:
             self._trusted_caller.reset(token)
+
+    @contextmanager
+    def expected_participant_decision(
+        self, decision_type: str, decision_id: str, amount: int
+    ) -> Iterator[None]:
+        """Lock the exact participant payload a Router request may submit."""
+
+        token = self._expected_participant_decision.set(
+            (decision_type, decision_id, amount)
+        )
+        try:
+            yield
+        finally:
+            self._expected_participant_decision.reset(token)
+
+    @contextmanager
+    def router_request_requires_participant_decision(self) -> Iterator[None]:
+        """Require every mutation routed through the adapter to carry a participant envelope."""
+
+        token = self._router_requires_participant_decision.set(True)
+        try:
+            yield
+        finally:
+            self._router_requires_participant_decision.reset(token)
+
+    def record_participant_decision(
+        self,
+        agent_id: AgentId,
+        decision: Mapping[str, Any],
+        *,
+        raw_request: str | None = None,
+        observation: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record the structured decision emitted by a participant model."""
+
+        self.participant_decisions.append(
+            {
+                "agent_id": agent_id,
+                "decision_source": "participant_model",
+                "decision_type": decision["decision_type"],
+                "decision_id": decision["decision_id"],
+                "amount": decision["amount"],
+                **({"raw_request": raw_request} if raw_request else {}),
+                **(
+                    {"participant_observation": copy.deepcopy(dict(observation))}
+                    if observation is not None
+                    else {}
+                ),
+            }
+        )
 
     def _validate_agent(self, agent_id: AgentId) -> AgentId:
         bound_agent_id = self._trusted_caller.get()
@@ -403,6 +494,15 @@ class RiskSharingEnv(EnvBase):
             raise ValueError("decision_type must be a string.")
         if type(amount) is not int:
             raise ValueError("Transfer amount must be a non-negative integer.")
+        expected = self._expected_participant_decision.get()
+        if self._router_requires_participant_decision.get() and expected is None:
+            raise PermissionError(
+                "Router cannot create an economic decision without a participant model envelope."
+            )
+        if expected is not None and (decision_type, decision_id, amount) != expected:
+            raise PermissionError(
+                "Router may only forward the exact decision emitted by the participant model."
+            )
         receipt = self._decision_receipts.get(decision_id)
         if receipt is not None:
             recorded_agent, period, recorded_type, recorded_amount = receipt
@@ -506,6 +606,25 @@ class RiskSharingRouterAdapter:
         self._router = router
         self._environment = environment
 
+    @property
+    def participant_decisions(self) -> list[dict[str, Any]]:
+        return self._environment.participant_decisions
+
+    def record_participant_decision(
+        self,
+        agent_id: AgentId,
+        decision: Mapping[str, Any],
+        *,
+        raw_request: str | None = None,
+        observation: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._environment.record_participant_decision(
+            agent_id,
+            decision,
+            raw_request=raw_request,
+            observation=observation,
+        )
+
     @staticmethod
     def _caller_from_context(ctx: Mapping[str, Any]) -> AgentId:
         if not isinstance(ctx, Mapping):
@@ -529,15 +648,69 @@ class RiskSharingRouterAdapter:
         parent_span_id: str | None = None,
     ) -> Any:
         caller_id = self._caller_from_context(ctx)
+
+        participant_decision = parse_participant_decision(instruction)
         with self._environment.caller_context(caller_id):
-            return await self._router.ask(
-                ctx,
-                instruction,
-                readonly=readonly,
-                template_mode=template_mode,
-                trace_id=trace_id,
-                parent_span_id=parent_span_id,
-            )
+            if participant_decision is not None:
+                # The participant model has already chosen every economic
+                # field.  The Router may route this RPC, but the environment
+                # rejects any altered, omitted, or fabricated value.
+                decision_type = participant_decision["decision_type"]
+                decision_id = participant_decision["decision_id"]
+                amount = participant_decision["amount"]
+                before = dict(self._environment._decision_receipts)
+                with self._environment.router_request_requires_participant_decision():
+                    with self._environment.expected_participant_decision(
+                        decision_type, decision_id, amount
+                    ):
+                        result = await self._router.ask(
+                            ctx,
+                            instruction,
+                            readonly=readonly,
+                            template_mode=template_mode,
+                            trace_id=trace_id,
+                            parent_span_id=parent_span_id,
+                        )
+                receipt = self._environment._decision_receipts.get(decision_id)
+                if receipt is None or receipt == before.get(decision_id):
+                    raise RuntimeError(
+                        "Router did not forward the participant model decision."
+                    )
+                return result
+
+            if readonly:
+                result = await self._router.ask(
+                    ctx,
+                    instruction,
+                    readonly=readonly,
+                    template_mode=template_mode,
+                    trace_id=trace_id,
+                    parent_span_id=parent_span_id,
+                )
+            else:
+                with self._environment.router_request_requires_participant_decision():
+                    result = await self._router.ask(
+                        ctx,
+                        instruction,
+                        readonly=readonly,
+                        template_mode=template_mode,
+                        trace_id=trace_id,
+                        parent_span_id=parent_span_id,
+                    )
+
+        # ReActRouter's normal final-answer path summarizes tool output.  For
+        # the participant's initial readonly observation, return the raw
+        # get_observation object so the participant model sees every legal
+        # field (including decision_id and the transfer range).
+        if readonly and instruction == "<observe>" and isinstance(result, tuple):
+            router_results = result[0]
+            if isinstance(router_results, Mapping):
+                observation = router_results.get("get_observation")
+                if isinstance(observation, Mapping):
+                    return result[0], json.dumps(
+                        observation, ensure_ascii=False, sort_keys=True
+                    )
+        return result
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._router, name)

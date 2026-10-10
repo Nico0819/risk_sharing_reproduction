@@ -9,9 +9,11 @@ import pytest
 from agentsociety2.env import ReActRouter
 
 from custom.envs.risk_sharing_env import (
+    PARTICIPANT_DECISION_PREFIX,
     RiskSharingEnv,
     RiskSharingRouterAdapter,
     Stage,
+    parse_participant_decision,
 )
 from protocol import paper_spec as spec
 
@@ -338,6 +340,52 @@ def test_router_adapter_cleanup_and_concurrent_contexts_are_isolated():
         call(failing.ask(ctx_a, "raise"))
     with pytest.raises(PermissionError, match="No trusted caller"):
         call(env.get_observation(caller_b))
+
+
+def test_router_cannot_replace_participant_amount_with_fallback():
+    env = RiskSharingEnv([1, 2], seed=22)
+    high, _ = high_and_low(env)
+    decision_id = observe(env, high)["decision_id"]
+    context = {"id": high, "agent_id": high, "person_id": high}
+    adapter = RiskSharingRouterAdapter(
+        ReActDispatchProbe(env, target_agent=high, action="write"), env
+    )
+    instruction = PARTICIPANT_DECISION_PREFIX + (
+        '{"decision_type":"transfer","decision_id":"'
+        + decision_id
+        + '","amount":100}'
+    )
+
+    with pytest.raises(PermissionError, match="exact decision"):
+        call(adapter.ask(context, instruction))
+    assert env.round_states[env.pair_by_agent[high]].transfer_amount == {}
+    assert env._decision_receipts == {}
+
+
+def test_router_cannot_create_decision_without_participant_envelope():
+    env = RiskSharingEnv([1, 2], seed=23)
+    high, _ = high_and_low(env)
+    context = {"id": high, "agent_id": high, "person_id": high}
+    adapter = RiskSharingRouterAdapter(
+        ReActDispatchProbe(env, target_agent=high, action="write"), env
+    )
+
+    with pytest.raises(PermissionError, match="without a participant model envelope"):
+        call(adapter.ask(context, "router-generated transfer"))
+    assert env.round_states[env.pair_by_agent[high]].transfer_amount == {}
+
+
+def test_participant_decision_envelope_requires_all_economic_fields():
+    with pytest.raises(ValueError, match="decision_type, decision_id, and amount"):
+        parse_participant_decision(
+            PARTICIPANT_DECISION_PREFIX
+            + '{"decision_type":"transfer","decision_id":"only-id"}'
+        )
+    with pytest.raises(ValueError, match="strict integer"):
+        parse_participant_decision(
+            PARTICIPANT_DECISION_PREFIX
+            + '{"decision_type":"transfer","decision_id":"id","amount":1.0}'
+        )
 
 
 def test_transfer_validation_is_before_receipt_and_submit_does_not_advance():

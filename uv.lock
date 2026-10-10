@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "agentsociety2", specifier = ">=2.9,<3" }]
+requires-dist = [{ name = "agentsociety2", specifier = "==2.9.0" }]
 
 [[package]]
 name = "agentsociety2"

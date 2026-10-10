@@ -1,4 +1,4 @@
-"""Run the bounded Baseline participant smoke experiment.
+"""Run the Baseline participant smoke or full-session experiment.
 
 The scripted backend exercises the real PersonAgent -> adapter -> ReActRouter
 -> tool -> RiskSharingEnv path without network access.  The deepseek backend
@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import re
+import random
 import sys
 import time
 import uuid
@@ -32,6 +33,7 @@ from custom.config import (  # noqa: E402
     RuntimeConfigError,
     load_runtime_config,
 )
+from protocol import paper_spec as protocol_spec  # noqa: E402
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -147,6 +149,24 @@ class BudgetedClient:
         return value if isinstance(value, dict) else {}
 
     @staticmethod
+    def _participant_decision(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Read the participant-owned decision envelope from Router input."""
+
+        marker = "RISK_SHARING_PARTICIPANT_DECISION:"
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, str) or marker not in content:
+                continue
+            raw = content.split(marker, 1)[1].split("\n", 1)[0].strip()
+            try:
+                value, _ = json.JSONDecoder().raw_decode(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and {"decision_type", "decision_id", "amount"}.issubset(value):
+                return value
+        return None
+
+    @staticmethod
     def _router_caller_id(messages: list[dict[str, Any]]) -> int | None:
         pattern = re.compile(r"id[^:]{0,3}:\s*(-?\d+)")
         for message in messages:
@@ -163,6 +183,7 @@ class BudgetedClient:
         *,
         required_tool: str,
         caller_id: int | None,
+        participant_decision: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         prepared = copy.deepcopy(tool)
         function = prepared.setdefault("function", {})
@@ -189,6 +210,11 @@ class BudgetedClient:
                 required.append("decision_id")
             if "amount" not in required:
                 required.append("amount")
+            if participant_decision is not None:
+                properties["decision_id"]["enum"] = [participant_decision["decision_id"]]
+                properties["decision_type"]["enum"] = [participant_decision["decision_type"]]
+                amount_schema = properties["amount"]
+                amount_schema.update({"type": "integer", "enum": [participant_decision["amount"]]})
 
         parameters["required"] = required
         return prepared
@@ -208,6 +234,7 @@ class BudgetedClient:
             return
 
         caller_id = self._router_caller_id(messages)
+        participant_decision = self._participant_decision(messages)
         latest_tool = next(
             (
                 message
@@ -223,11 +250,24 @@ class BudgetedClient:
                     tool,
                     required_tool="get_observation",
                     caller_id=caller_id,
+                    participant_decision=participant_decision,
                 )
                 for tool in self._router_tool_schemas
                 if isinstance(tool.get("function"), dict)
                 and tool["function"].get("name") == "get_observation"
             ]
+            if participant_decision is not None:
+                first_tool = [
+                    self._prepared_router_tool(
+                        tool,
+                        required_tool="submit_decision",
+                        caller_id=caller_id,
+                        participant_decision=participant_decision,
+                    )
+                    for tool in self._router_tool_schemas
+                    if isinstance(tool.get("function"), dict)
+                    and tool["function"].get("name") == "submit_decision"
+                ]
             if first_tool:
                 kwargs["tools"] = first_tool
                 kwargs["tool_choice"] = "required"
@@ -262,6 +302,7 @@ class BudgetedClient:
                 tool,
                 required_tool=required_tool,
                 caller_id=caller_id,
+                participant_decision=participant_decision,
             )
             for tool in self._router_tool_schemas
             if isinstance(tool.get("function"), dict)
@@ -329,14 +370,32 @@ class BudgetedClient:
             else:
                 allowed_name = "finish"
         else:
-            allowed_name = "ask_env"
+            # PersonAgent.step() has already supplied the readonly observation
+            # in the initial participant prompt.  Permit the model to choose
+            # either its structured decision or a waiting finish.
+            has_initial_observation = any(
+                isinstance(message.get("content"), str)
+                and '"observations": [' in message["content"]
+                and "<risk_sharing_turn>" in message["content"]
+                for message in messages
+                if isinstance(message, dict)
+            )
+            allowed_name = "ask_env" if not has_initial_observation else None
 
-        restricted = [
-            copy.deepcopy(tool)
-            for tool in self._participant_tool_schemas
-            if isinstance(tool.get("function"), dict)
-            and tool["function"].get("name") == allowed_name
-        ]
+        if allowed_name is None:
+            restricted = [
+                copy.deepcopy(tool)
+                for tool in self._participant_tool_schemas
+                if isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") in {"ask_env", "finish"}
+            ]
+        else:
+            restricted = [
+                copy.deepcopy(tool)
+                for tool in self._participant_tool_schemas
+                if isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") == allowed_name
+            ]
         if not restricted:
             return
 
@@ -354,30 +413,7 @@ class BudgetedClient:
             parameters["required"] = required
 
         kwargs["tools"] = restricted
-        kwargs["tool_choice"] = "required"
-
-    @staticmethod
-    def _normalize_participant_response(response: Any) -> Any:
-        """Prevent an extra readonly ask_env turn in this bounded runner."""
-
-        choices = getattr(response, "choices", None) or []
-        for choice in choices:
-            message = getattr(choice, "message", None)
-            for tool_call in getattr(message, "tool_calls", None) or []:
-                function = getattr(tool_call, "function", None)
-                if getattr(function, "name", None) != "ask_env":
-                    continue
-                raw_arguments = getattr(function, "arguments", "{}") or "{}"
-                try:
-                    arguments = json.loads(raw_arguments)
-                except (TypeError, json.JSONDecodeError):
-                    continue
-                if isinstance(arguments, dict) and arguments.get("readonly") is True:
-                    arguments["readonly"] = False
-                    function.arguments = json.dumps(
-                        arguments, ensure_ascii=False
-                    )
-        return response
+        kwargs["tool_choice"] = "auto" if allowed_name is None else "required"
 
     async def call(self, model: str | None = None, messages=None, **kwargs: Any):
         self.budget.reserve()
@@ -388,8 +424,6 @@ class BudgetedClient:
         # LLMClient clamps this to one actual attempt; no unbounded retry loop.
         kwargs["max_retries"] = 0
         response = await self.inner.call(model=model, messages=messages, **kwargs)
-        if self.enforce_participant_progression:
-            response = self._normalize_participant_response(response)
         self.budget.record_usage(response)
         return response
 
@@ -448,6 +482,59 @@ class ScriptedLLMClient:
             return {}
 
     @staticmethod
+    def _participant_turn(messages: Iterable[dict[str, Any]]) -> tuple[int, dict[str, Any]] | None:
+        """Extract the raw observation included in a participant prompt."""
+
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, str) or "<risk_sharing_turn>" not in content:
+                continue
+            try:
+                raw = content.split("<risk_sharing_turn>", 1)[1].split(
+                    "</risk_sharing_turn>", 1
+                )[0].strip()
+                payload = json.loads(raw)
+            except (IndexError, TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            observations = payload.get("observations") or []
+            for item in reversed(observations):
+                value = item.get("observation") if isinstance(item, dict) else None
+                if isinstance(value, str):
+                    try:
+                        observation = json.loads(value)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(observation, dict):
+                        return int(payload["agent_id"]), observation
+        return None
+
+    @staticmethod
+    def _participant_amount(agent_id: int, observation: dict[str, Any]) -> int:
+        """Deterministic participant policy with agent-specific amounts."""
+
+        upper = int((observation.get("legal_transfer_range") or {}).get("max", 0))
+        proposed = 13 + agent_id * 17
+        return min(upper, proposed)
+
+    @staticmethod
+    def _participant_decision(messages: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+        marker = "RISK_SHARING_PARTICIPANT_DECISION:"
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, str) or marker not in content:
+                continue
+            raw = content.split(marker, 1)[1].split("\n", 1)[0].strip()
+            try:
+                value, _ = json.JSONDecoder().raw_decode(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        return None
+
+    @staticmethod
     def _caller_id(messages: Iterable[dict[str, Any]]) -> int:
         """Read the framework identity from ReActRouter's initial ctx text.
 
@@ -504,16 +591,51 @@ class ScriptedLLMClient:
                         ],
                     },
                 )
+            participant_turn = self._participant_turn(messages)
+            if participant_turn is None:
+                return self._response(
+                    name="ask_env",
+                    arguments={
+                        "instruction": "没有可用 observation；请先通过环境读取当前 observation。",
+                        "readonly": False,
+                    },
+                )
+            participant_id, observation = participant_turn
+            if observation.get("task") != "transfer":
+                return self._response(
+                    name="finish",
+                    arguments={
+                        "final": "没有转账机会，本轮等待。",
+                        "memories": [{"text": "等待", "type": "observation"}],
+                    },
+                )
+            decision = {
+                "decision_type": "transfer",
+                "decision_id": observation.get("decision_id"),
+                "amount": self._participant_amount(participant_id, observation),
+            }
             return self._response(
                 name="ask_env",
                 arguments={
-                    "instruction": "读取当前 pair observation；若我有转账机会，选择合法整数并提交 transfer，否则等待。",
+                    "instruction": "RISK_SHARING_PARTICIPANT_DECISION:"
+                    + json.dumps(decision, ensure_ascii=False, separators=(",", ":")),
                     "readonly": False,
                 },
             )
 
         # ReActRouter's first request advertises environment tools.  Subsequent
         # requests omit schemas but retain named tool result messages.
+        participant_decision = self._participant_decision(messages)
+        if not tool_messages and participant_decision is not None and "submit_decision" in names:
+            return self._response(
+                name="submit_decision",
+                arguments={
+                    "agent_id": caller_id,
+                    "decision_id": participant_decision["decision_id"],
+                    "decision_type": participant_decision["decision_type"],
+                    "amount": participant_decision["amount"],
+                },
+            )
         if not tool_messages and "get_observation" in names:
             return self._response(name="get_observation", arguments={"agent_id": caller_id})
         if tool_messages:
@@ -521,26 +643,27 @@ class ScriptedLLMClient:
             last_name = str(last.get("name") or "")
             value = self._decode_tool_content(last)
             if last_name == "get_observation":
-                if (not readonly_request) and value.get("task") == "transfer" and value.get("decision_id"):
+                if (not readonly_request) and participant_decision is not None:
                     return self._response(
                         name="submit_decision",
                         arguments={
                             "agent_id": caller_id,
-                            "decision_id": value["decision_id"],
-                            "decision_type": "transfer",
-                            "amount": 0,
+                            "decision_id": participant_decision["decision_id"],
+                            "decision_type": participant_decision["decision_type"],
+                            "amount": participant_decision["amount"],
                         },
                     )
+                if (not readonly_request) and value.get("task") == "transfer":
+                    return self._response(content="participant decision missing")
+                if readonly_request:
+                    return self._response(content="observation returned")
                 return self._response(
                     name="set_status",
                     arguments={"status": "success", "reason": "waiting"},
                 )
             if last_name in {"submit_decision", "set_status"}:
                 if last_name == "submit_decision":
-                    return self._response(
-                        name="set_status",
-                        arguments={"status": "success", "reason": "decision recorded"},
-                    )
+                    return self._response(content="decision forwarded")
                 return self._response(content="environment request completed")
             if value.get("error"):
                 return self._response(content="environment request failed")
@@ -555,6 +678,17 @@ def _jsonl_append(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 
 def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _select_payment_period(completed_periods: list[int], seed: int) -> int:
+    """Select one realized period without consuming the environment RNG."""
+
+    if not completed_periods:
+        raise ValueError("Cannot select a payment period before settlement.")
+    material = f"risk-sharing-payment-v1:{seed}".encode("utf-8")
+    payment_seed = int.from_bytes(hashlib.sha256(material).digest()[:16], "big")
+    payment_rng = random.Random(payment_seed)
+    return completed_periods[payment_rng.randrange(len(completed_periods))]
 
 
 def _make_run_dir(path: Path | None) -> Path:
@@ -573,8 +707,14 @@ def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
-def _safe_action_records(records: list[dict[str, Any]], env: Any, framework_step: int) -> list[dict[str, Any]]:
+def _safe_action_records(
+    records: list[dict[str, Any]],
+    env: Any,
+    framework_step: int,
+    participant_decisions: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     safe: list[dict[str, Any]] = []
+    participant_decisions = participant_decisions or []
     for record in records:
         kwargs = dict(record.get("kwargs") or {})
         function_name = record.get("function_name")
@@ -588,11 +728,38 @@ def _safe_action_records(records: list[dict[str, Any]], env: Any, framework_step
         }
         if function_name == "get_observation":
             row["observation"] = record.get("return_value")
+            row["router_action"] = "get_observation"
+            row["decision_source"] = "router_tool_routing"
         elif function_name == "submit_decision":
-            row["model_choice"] = {"decision_type": kwargs.get("decision_type"), "amount": kwargs.get("amount")}
+            row["router_action"] = "submit_decision"
             row["submitted_amount"] = kwargs.get("amount")
             row["decision_id"] = kwargs.get("decision_id")
             row["receipt"] = record.get("return_value")
+            row["environment_receipt"] = record.get("return_value")
+            participant = next(
+                (
+                    item
+                    for item in participant_decisions
+                    if item.get("agent_id") == agent_id
+                    and item.get("decision_id") == kwargs.get("decision_id")
+                ),
+                None,
+            )
+            if participant is not None:
+                row["decision_source"] = "participant_model"
+                row["participant_model_output"] = {
+                    "decision_type": participant.get("decision_type"),
+                    "decision_id": participant.get("decision_id"),
+                    "amount": participant.get("amount"),
+                }
+                if isinstance(participant.get("participant_observation"), dict):
+                    row["participant_model_message"] = {
+                        "observation": participant["participant_observation"],
+                        "contains_observation": True,
+                    }
+                row["participant_amount"] = participant.get("amount")
+            else:
+                row["decision_source"] = "router_or_unknown"
         if record.get("exception_occurred"):
             row["error"] = record.get("exception_info")
         safe.append(row)
@@ -604,6 +771,7 @@ async def _run_async(
     cfg: RuntimeConfig,
     participants: int,
     completed_period_limit: int,
+    full_session: bool,
     seed: int,
     run_dir: Path,
     request_limit: int,
@@ -619,6 +787,7 @@ async def _run_async(
         config_status=cfg.safe_status(),
         participants=participants,
         completed_period_limit=completed_period_limit,
+        full_session=full_session,
         request_limit=request_limit,
         max_output_tokens=max_output_tokens,
         timeout_seconds=timeout_seconds,
@@ -705,9 +874,14 @@ async def _run_async(
     scheduler_steps = 0
     result_batches: list[dict[str, Any]] = []
     failure_details: list[dict[str, Any]] = []
-    max_scheduler_steps = max(3, completed_period_limit * 4)
+    max_scheduler_steps = (
+        max(3, protocol_spec.REAL_MAXIMUM_PERIOD_COUNT * 4)
+        if full_session
+        else max(3, completed_period_limit * 4)
+    )
     started = time.monotonic()
-    while len(env.completed_periods) < completed_period_limit:
+    participant_decision_cursor = 0
+    while (not env.finished) if full_session else (len(env.completed_periods) < completed_period_limit):
         if scheduler_steps >= max_scheduler_steps:
             stop_reason = "scheduler_step_limit"
             run_log.write("stop_requested", reason=stop_reason, scheduler_step=scheduler_steps)
@@ -736,8 +910,15 @@ async def _run_async(
                 )
             )
         result_batches.extend(batch)
+        participant_decisions = adapter.participant_decisions[
+            participant_decision_cursor:
+        ]
+        participant_decision_cursor = len(adapter.participant_decisions)
         step_actions = _safe_action_records(
-            env.get_tool_call_history()[start_history:], env, scheduler_steps
+            env.get_tool_call_history()[start_history:],
+            env,
+            scheduler_steps,
+            participant_decisions,
         )
         _jsonl_append(action_path, step_actions)
         run_log.write(
@@ -753,6 +934,8 @@ async def _run_async(
                     if isinstance(row.get("observation"), dict)
                     else None,
                     "submitted_amount": row.get("submitted_amount"),
+                    "participant_amount": row.get("participant_amount"),
+                    "decision_source": row.get("decision_source"),
                     "error": row.get("error"),
                 }
                 for row in step_actions
@@ -777,12 +960,16 @@ async def _run_async(
             run_log.write("agent_error", scheduler_step=scheduler_steps, failures=failure_details)
             break
         before = len(env.completed_periods)
+        period_before = env.current_period
         await adapter.step(1, now)
         after = len(env.completed_periods)
         run_log.write(
             "scheduler_step_finished",
             scheduler_step=scheduler_steps,
-            period_before=env.current_period if after == before else env.current_period - 1,
+            period_before=period_before,
+            period_after=env.current_period,
+            settled_period=env.completed_periods[-1] if after > before else None,
+            finished=env.finished,
             completed_periods=list(env.completed_periods),
             model_requests=budget.calls,
         )
@@ -796,26 +983,72 @@ async def _run_async(
             run_log.write("stop_requested", reason=stop_reason, scheduler_step=scheduler_steps)
             break
     else:
-        stop_reason = "smoke_period_limit"
+        stop_reason = "natural_termination" if full_session else "smoke_period_limit"
 
     # Records come directly from the environment, never from model text.
     _jsonl_append(records_path, env.history)
+    payment_period: int | None = None
+    payment_path: Path | None = None
+    payment_records: list[dict[str, Any]] = []
+    if full_session and env.finished:
+        payment_period = _select_payment_period(list(env.completed_periods), seed)
+        payment_records = [
+            dict(record)
+            for record in env.history
+            if int(record["period"]) == payment_period
+        ]
+        payment_path = run_dir / "payment.json"
+        _write_manifest(
+            payment_path,
+            {
+                "schema_version": 1,
+                "selection_rule": "uniformly select one realized period",
+                "selected_period": payment_period,
+                "records": payment_records,
+            },
+        )
+        run_log.write(
+            "payment_selected",
+            selected_period=payment_period,
+            realized_period_count=len(env.completed_periods),
+            record_count=len(payment_records),
+        )
+
     valid_decisions = [
         item for item in env.get_tool_call_history()
         if item.get("function_name") == "submit_decision" and not item.get("exception_occurred")
     ]
     unique_decisions = {str(item.get("kwargs", {}).get("decision_id")) for item in valid_decisions}
-    successful = (
-        stop_reason == "smoke_period_limit"
-        and len(env.completed_periods) >= completed_period_limit
-        and len(unique_decisions) == 2 * completed_period_limit
-        and len(env.history) == 4 * completed_period_limit
+    expected_period_count = (
+        len(env.completed_periods) if full_session else completed_period_limit
     )
-    if not successful and stop_reason == "smoke_period_limit":
+    records_complete = (
+        len(unique_decisions) == 2 * expected_period_count
+        and len(env.history) == 4 * expected_period_count
+    )
+    if full_session:
+        successful = (
+            stop_reason == "natural_termination"
+            and env.finished
+            and protocol_spec.REAL_TERMINATION_FIRST_POSSIBLE_PERIOD
+            <= max(env.completed_periods, default=0)
+            <= protocol_spec.REAL_TERMINATION_FORCED_PERIOD
+            and records_complete
+            and payment_period in env.completed_periods
+            and len(payment_records) == 2 * len(env.pair_members)
+        )
+    else:
+        successful = (
+            stop_reason == "smoke_period_limit"
+            and len(env.completed_periods) >= completed_period_limit
+            and records_complete
+        )
+    if not successful and stop_reason in {"smoke_period_limit", "natural_termination"}:
         stop_reason = "incomplete_records"
 
     manifest = {
         "schema_version": 1,
+        "run_mode": "full_session" if full_session else "smoke",
         "backend": cfg.backend,
         "router": "ReActRouter",
         "agent_class": "RiskSharingParticipant",
@@ -833,6 +1066,9 @@ async def _run_async(
         "actual_input_tokens": budget.input_tokens,
         "actual_output_tokens": budget.output_tokens,
         "completed_periods": list(env.completed_periods),
+        "natural_termination": env.finished,
+        "payment_period": payment_period,
+        "payment_file": payment_path.name if payment_path else None,
         "stop_reason": stop_reason,
         "success": successful,
         "run_dir": str(run_dir),
@@ -844,7 +1080,7 @@ async def _run_async(
     _write_manifest(run_dir / "manifest.json", manifest)
 
     summary_lines = [
-        f"# Baseline smoke ({cfg.backend})",
+        f"# Baseline {'full session' if full_session else 'smoke'} ({cfg.backend})",
         "",
         f"- success: `{successful}`",
         f"- stop_reason: `{stop_reason}`",
@@ -862,15 +1098,33 @@ async def _run_async(
                 transfer = next((r["transfer_sent"] for r in rows if r["had_transfer_opportunity"]), 0)
                 final = ", ".join(f"{r['agent_id']}={r['final_income']}" for r in rows)
                 summary_lines.append(f"- period {period}, pair {pair_id}: transfer={transfer}; final=({final})")
+    if full_session:
+        summary_lines.extend(
+            [
+                "",
+                "## Natural termination",
+                "",
+                f"- finished: `{env.finished}`",
+                f"- realized periods: `{len(env.completed_periods)}`",
+                f"- payment period: `{payment_period}`",
+                f"- payment file: `{payment_path.name if payment_path else None}`",
+            ]
+        )
     if failure_details:
         summary_lines.extend(["", "## Failure details", ""])
         for item in failure_details:
             summary_lines.append(f"- agent {item.get('agent_id')}: {item.get('error')}")
-    summary_lines.extend([
-        "",
-        "Run diagnostics: `run.log` (JSONL; credential-like values redacted).",
-        "Payment selection is not implemented; this is an externally truncated engineering smoke run, not a completed paper payment experiment.",
-    ])
+    summary_lines.extend(
+        [
+            "",
+            "Run diagnostics: `run.log` (JSONL; credential-like values redacted).",
+        ]
+    )
+    if not full_session:
+        summary_lines.append(
+            "Payment selection is not performed in smoke mode; use `--full-session` "
+            "for natural termination and payment-period selection."
+        )
     run_log.write(
         "run_finished",
         success=successful,
@@ -884,7 +1138,7 @@ async def _run_async(
 
 
 def run_experiment(**kwargs: Any) -> dict[str, Any]:
-    """Run one bounded smoke experiment and return the non-secret manifest."""
+    """Run a bounded smoke or a natural-termination full Baseline session."""
 
     backend = str(kwargs.get("backend", "scripted"))
     cfg = load_runtime_config(
@@ -898,6 +1152,7 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             cfg=cfg,
             participants=int(kwargs.get("participants", 4)),
             completed_period_limit=int(kwargs.get("completed_period_limit", 3)),
+            full_session=bool(kwargs.get("full_session", False)),
             seed=int(kwargs.get("seed", 2026)),
             run_dir=run_dir,
             request_limit=int(kwargs.get("request_limit", 80)),
@@ -937,7 +1192,17 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("scripted", "deepseek"), required=True)
     parser.add_argument("--participants", type=int, default=4)
-    parser.add_argument("--completed-period-limit", type=int, default=3)
+    parser.add_argument(
+        "--completed-period-limit",
+        type=int,
+        default=3,
+        help="Smoke-mode target; ignored by --full-session.",
+    )
+    parser.add_argument(
+        "--full-session",
+        action="store_true",
+        help="Run until the environment reaches the paper's natural termination.",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--request-limit", type=int, default=80)
@@ -960,12 +1225,13 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeConfigError as exc:
         print(f"配置未就绪：{exc}", file=sys.stderr)
         return 2
-    print(json.dumps({"config": cfg.safe_status(), "limits": {"requests": args.request_limit, "max_output_tokens": args.max_output_tokens, "timeout_seconds": args.timeout_seconds}}, ensure_ascii=False))
+    print(json.dumps({"config": cfg.safe_status(), "limits": {"requests": args.request_limit, "max_output_tokens": args.max_output_tokens, "timeout_seconds": args.timeout_seconds, "full_session": args.full_session}}, ensure_ascii=False))
     try:
         manifest = run_experiment(
             backend=args.backend,
             participants=args.participants,
             completed_period_limit=args.completed_period_limit,
+            full_session=args.full_session,
             seed=args.seed,
             run_dir=args.run_dir,
             request_limit=args.request_limit,

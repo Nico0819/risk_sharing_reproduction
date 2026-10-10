@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from custom.config import RuntimeConfigError, load_runtime_config
 from custom.envs.risk_sharing_env import RiskSharingEnv
-from experiments.baseline.run_smoke import run_experiment
+from experiments.baseline.run_smoke import (
+    ScriptedLLMClient,
+    _select_payment_period,
+    run_experiment,
+)
 
 
 _FRAMEWORK_VARS = (
@@ -98,6 +103,25 @@ def test_scripted_runner_uses_real_agent_router_adapter_and_is_bounded(tmp_path,
     assert len(records) == 12
     assert all(row["treatment"] == "baseline" for row in records)
 
+    submitted = [row for row in actions if row.get("action") == "submit_decision"]
+    assert len(submitted) == 2 * 3
+    assert len({row["submitted_amount"] for row in submitted[:2]}) == 2
+    assert all(row["decision_source"] == "participant_model" for row in submitted)
+    assert all(
+        row["submitted_amount"]
+        == row["participant_amount"]
+        == row["participant_model_output"]["amount"]
+        == row["environment_receipt"]["amount"]
+        for row in submitted
+    )
+    assert all(row["participant_model_message"]["contains_observation"] for row in submitted)
+    assert all(
+        row["participant_model_message"]["observation"]["decision_id"]
+        == row["decision_id"]
+        for row in submitted
+    )
+    assert all(row["router_action"] == "submit_decision" for row in submitted)
+
     participant_forbidden = {"treatment", "analysis_phase", "session_id"}
     participant_rows = [
         row.get("observation")
@@ -117,3 +141,53 @@ def test_scripted_runner_uses_real_agent_router_adapter_and_is_bounded(tmp_path,
     assert log_rows[-1]["event"] == "run_finished"
     assert log_rows[-1]["success"] is True
     assert "DEEPSEEK_API_KEY" not in log_path.read_text(encoding="utf-8")
+
+
+def test_full_session_reaches_natural_termination_and_writes_payment_period(tmp_path, monkeypatch):
+    _clear_runtime(monkeypatch)
+    manifest = run_experiment(
+        backend="scripted",
+        participants=4,
+        completed_period_limit=1,
+        full_session=True,
+        seed=2026,
+        run_dir=tmp_path / "full-run",
+        request_limit=2000,
+        max_output_tokens=512,
+        timeout_seconds=300,
+    )
+
+    assert manifest["success"] is True
+    assert manifest["run_mode"] == "full_session"
+    assert manifest["stop_reason"] == "natural_termination"
+    assert manifest["natural_termination"] is True
+    assert manifest["completed_periods"][-1] in {48, 49, 50}
+    assert manifest["payment_period"] in manifest["completed_periods"]
+    assert manifest["payment_file"] == "payment.json"
+
+    run_dir = tmp_path / "full-run"
+    payment = json.loads((run_dir / "payment.json").read_text(encoding="utf-8"))
+    records = [json.loads(line) for line in (run_dir / "period_records.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert payment["selected_period"] == manifest["payment_period"]
+    assert len(payment["records"]) == 4
+    assert len(records) == 4 * len(manifest["completed_periods"])
+    assert {row["period"] for row in payment["records"]} == {manifest["payment_period"]}
+    assert all(row["treatment"] == "baseline" for row in payment["records"])
+
+
+def test_payment_period_selection_is_deterministic_and_realized():
+    realized = [1, 2, 48]
+    selected_first = _select_payment_period(realized, seed=2026)
+    selected_second = _select_payment_period(realized, seed=2026)
+    assert selected_first == selected_second
+    assert selected_first in realized
+    with pytest.raises(ValueError, match="before settlement"):
+        _select_payment_period([], seed=2026)
+
+
+def test_scripted_participant_cannot_submit_without_observation():
+    client = ScriptedLLMClient("participant")
+    response = asyncio.run(client.call(messages=[]))
+    arguments = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+    assert arguments["readonly"] is False
+    assert "RISK_SHARING_PARTICIPANT_DECISION:" not in arguments["instruction"]

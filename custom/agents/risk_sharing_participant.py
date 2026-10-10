@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from agentsociety2.agent import PersonAgent
+from agentsociety2.agent.base.react import ReactToolResult
+
+from custom.envs.risk_sharing_env import parse_participant_decision
 
 
 PROMPT_PATH = Path(__file__).with_name("risk_sharing_participant.md")
@@ -28,33 +31,43 @@ class RiskSharingParticipant(PersonAgent):
         )
 
     async def step(self, tick: int, t: datetime) -> str:
-        """Run one model-driven action without a second pre-observation call.
+        """Use PersonAgent's real observe-then-react lifecycle."""
 
-        The base PersonAgent performs a readonly ``<observe>`` request before
-        every action loop. This project environment already exposes the
-        current observation through the participant's real ``ask_env`` tool
-        call, so omitting that redundant call keeps the bounded smoke within
-        its request budget while retaining the PersonAgent/ReAct lifecycle.
-        """
+        return await super().step(tick, t)
 
-        await self._ensure_initialized()
-        self._step_count += 1
-        self._current_time = t
-        self._refresh_visible_skills()
-        self.persist_agent_json(tick=tick, t=t)
-        result = await self.run_react_loop(
-            tick=tick,
-            t=t,
-            observations=[],
-            skill_hooks=None,
-        )
-        await self._memory_runtime.after_step(
-            tick=tick,
-            t=t,
-            step_count=self._step_count,
-            finish_memories=self._last_finish_memories,
-        )
-        return result
+    async def dispatch_react_tool(
+        self,
+        action: str,
+        args: dict[str, Any],
+        *,
+        readonly: bool = False,
+    ):
+        """Record a participant decision before sending it to ``ask_env``."""
+
+        if action == "ask_env":
+            instruction = str(args.get("instruction") or "")
+            decision = parse_participant_decision(instruction)
+            if (
+                getattr(self, "_last_participant_observation", None) is not None
+                and decision is None
+            ):
+                return ReactToolResult(
+                    False,
+                    "The current observation was already provided; submit your own structured decision or finish waiting.",
+                    {"error": "observation_already_read"},
+                )
+            if decision is not None and self._env is not None:
+                recorder = getattr(self._env, "record_participant_decision", None)
+                if recorder is not None:
+                    recorder(
+                        self.id,
+                        decision,
+                        raw_request=instruction,
+                        observation=getattr(
+                            self, "_last_participant_observation", None
+                        ),
+                    )
+        return await super().dispatch_react_tool(action, args, readonly=readonly)
 
     def build_react_messages(
         self,
@@ -75,6 +88,17 @@ class RiskSharingParticipant(PersonAgent):
             "readonly": readonly,
             "question": question,
         }
+        self._last_participant_observation = None
+        for item in reversed(observations):
+            value = item.get("observation") if isinstance(item, dict) else None
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    self._last_participant_observation = parsed
+                    break
         return [
             {"role": "system", "content": rules},
             {
