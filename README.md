@@ -170,26 +170,12 @@ cd /home/zhicheng/risk_sharing_reproduction
 
 测试覆盖了协议常量、pair 和 history 隔离、真实 AgentSociety2 集成链路、身份伪造、旧 `decision_id`、非法金额、低收入 Agent、格式错误后的修正，以及 Router 改写参与者金额或凭证时被环境拒绝等情况。
 
-## 还没有完成的部分
+## 后续工作
 
-这不是完整的论文复现。目前还缺：
+目前先实现了 Baseline，接下来会加入 25V 自愿保险和 25F 强制保险。25F 的 assignment probability 还需要核对论文资料。
 
-- 25V 自愿保险和 25F 强制保险；25F 的 assignment probability 也还没有从论文资料中确定；
-- 统计分析、回归和结果图表；
-- 真实的外部支付系统；
-- 外部 LLM 的稳定运行和成本/结果评估；
-- 最终的经济行为 prompt 和策略校准。现在 scripted policy 只是为了测试调用边界，并不是研究结论。
+参与者提示词和策略设定还在调整。后续会通过重复实验检查 LLM 的运行稳定性、调用成本和实验结果，再补充统计分析、回归和结果图表。`scripted` 模式中的策略用于测试程序流程。
 
-论文规则集中写在 [`protocol/paper_spec.py`](protocol/paper_spec.py)，这个文件目前视为冻结，不应该为了让 Baseline 跑通而修改。
+支付部分目前只生成随机选中的轮次及对应收益记录，尚未接入实际支付系统。
 
-## 希望别人帮我看什么
-
-如果你愿意帮忙审阅，最希望得到这几方面的意见：
-
-1. participant model、兼容用的 `ReActRouter` 对象和 `RiskSharingRouterAdapter` 的责任边界是否真的清楚；
-2. 现有日志和测试能不能证明 amount 来自对应的 participant model；
-3. AgentSociety2 的身份 context 是否在所有环境调用路径上都可靠；
-4. participant observation 是否有意外的信息泄露；
-5. 现在的环境接口是否适合之后继续加入 25V、25F 和分析模块。
-
-相关入口：[`experiments/baseline/README.md`](experiments/baseline/README.md)、[`custom/envs/risk_sharing_env.py`](custom/envs/risk_sharing_env.py)、[`custom/agents/risk_sharing_participant.py`](custom/agents/risk_sharing_participant.py) 和 [`tests/test_baseline_integration.py`](tests/test_baseline_integration.py)。
+论文规则统一记录在 [`protocol/paper_spec.py`](protocol/paper_spec.py) 中，目前保持冻结，作为各模块实现的依据。更详细的运行说明见 [`experiments/baseline/README.md`](experiments/baseline/README.md)。
