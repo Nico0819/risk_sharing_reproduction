@@ -1,4 +1,4 @@
-"""Project-local configuration loading with secret-safe DeepSeek mapping.
+"""Project-local configuration loading with secret-safe LLM mapping.
 
 The loader reads the project-root ``.env`` explicitly and never prints its
 contents.  It maps the three project variables to the names consumed by the
@@ -16,8 +16,8 @@ from typing import Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
-DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_BASE_URL = ""
+DEFAULT_MODEL = ""
 _PLACEHOLDER_VALUES = {"", "changeme", "your_key_here", "your-api-key", "<your-api-key>"}
 
 
@@ -112,7 +112,7 @@ def _set_consistent(name: str, value: str) -> None:
 
 
 def _apply_framework_settings(*, api_key: str, base_url: str, model: str) -> None:
-    """Map one DeepSeek configuration to both AgentSociety2 LLM roles."""
+    """Map one external LLM configuration to both AgentSociety2 LLM roles."""
 
     for name, value in (
         ("AGENTSOCIETY_LLM_API_KEY", api_key),
@@ -124,9 +124,8 @@ def _apply_framework_settings(*, api_key: str, base_url: str, model: str) -> Non
     ):
         _set_consistent(name, value)
 
-    # DeepSeek documents this OpenAI-compatible extra_body switch for Chat
-    # Completions.  Refuse a conflicting pre-existing policy instead of
-    # silently enabling thinking.
+    # Keep reasoning disabled for the experiment unless the framework setting
+    # is already an explicit disabled value.
     for name in ("AGENTSOCIETY_LLM_THINKING", "AGENTSOCIETY_CODER_LLM_THINKING"):
         existing = os.environ.get(name, "").strip().lower()
         if existing and existing not in {"off", "0", "false", "disable", "disabled", "no"}:
@@ -167,11 +166,11 @@ def load_runtime_config(
     require_credentials: bool | None = None,
     request_timeout: float = 60.0,
 ) -> RuntimeConfig:
-    """Load scripted or DeepSeek mode before importing AgentSociety2 config."""
+    """Load scripted or generic LLM mode before importing AgentSociety2 config."""
 
     backend = backend.strip().lower()
-    if backend not in {"scripted", "deepseek"}:
-        raise RuntimeConfigError("backend must be scripted or deepseek")
+    if backend not in {"scripted", "llm"}:
+        raise RuntimeConfigError("backend must be scripted or llm")
     path = (env_path or DEFAULT_ENV_PATH).expanduser().resolve()
     dotenv = _parse_dotenv(path)
 
@@ -189,19 +188,19 @@ def load_runtime_config(
             api_key="",
         )
 
-    api_key = _resolved_value("DEEPSEEK_API_KEY", dotenv)
-    base_url = _resolved_value("DEEPSEEK_BASE_URL", dotenv) or DEFAULT_BASE_URL
-    model = _resolved_value("DEEPSEEK_MODEL", dotenv)
+    api_key = _resolved_value("LLM_API_KEY", dotenv)
+    base_url = _resolved_value("LLM_BASE_URL", dotenv) or DEFAULT_BASE_URL
+    model = _resolved_value("LLM_MODEL", dotenv) or DEFAULT_MODEL
     if require_credentials is not False:
         missing: list[str] = []
         if not _is_real_value(api_key):
-            missing.append("DEEPSEEK_API_KEY")
+            missing.append("LLM_API_KEY")
         if not _is_real_value(base_url):
-            missing.append("DEEPSEEK_BASE_URL")
+            missing.append("LLM_BASE_URL")
         if not _is_real_value(model):
-            missing.append("DEEPSEEK_MODEL")
+            missing.append("LLM_MODEL")
         if missing:
-            raise RuntimeConfigError("missing or placeholder DeepSeek configuration: " + ", ".join(missing))
+            raise RuntimeConfigError("missing or placeholder LLM configuration: " + ", ".join(missing))
     _apply_framework_settings(api_key=api_key, base_url=base_url, model=model)
     os.environ.setdefault("AGENTSOCIETY_LLM_REQUEST_TIMEOUT", str(request_timeout))
     return RuntimeConfig(
@@ -220,7 +219,7 @@ def inspect_config_status(*, env_path: Path | None = None) -> dict[str, str]:
     dotenv = _parse_dotenv(path)
     return {
         "env_path": str(path),
-        "api_key": "configured" if _is_real_value(_resolved_value("DEEPSEEK_API_KEY", dotenv)) else "not configured",
-        "base_url": "configured" if _is_real_value(_resolved_value("DEEPSEEK_BASE_URL", dotenv) or DEFAULT_BASE_URL) else "not configured",
-        "model": "configured" if _is_real_value(_resolved_value("DEEPSEEK_MODEL", dotenv)) else "not configured",
+        "api_key": "configured" if _is_real_value(_resolved_value("LLM_API_KEY", dotenv)) else "not configured",
+        "base_url": "configured" if _is_real_value(_resolved_value("LLM_BASE_URL", dotenv) or DEFAULT_BASE_URL) else "not configured",
+        "model": "configured" if _is_real_value(_resolved_value("LLM_MODEL", dotenv) or DEFAULT_MODEL) else "not configured",
     }

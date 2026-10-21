@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -11,11 +12,13 @@ from agentsociety2.env import ReActRouter
 from custom.envs.risk_sharing_env import (
     PARTICIPANT_DECISION_PREFIX,
     RiskSharingEnv,
+    RiskSharingReActRouter,
     RiskSharingRouterAdapter,
     Stage,
     parse_participant_decision,
 )
 from protocol import paper_spec as spec
+from experiments.baseline.run_smoke import BudgetedClient, RequestBudget, ScriptedLLMClient
 
 
 def call(awaitable):
@@ -82,40 +85,21 @@ class SequenceRng:
         return self.values.pop(0)
 
 
-class ReActDispatchProbe(ReActRouter):
-    """Router-dispatch component probe; this is not a full PersonAgent test."""
+class OfflineRouter(RiskSharingReActRouter):
+    """Real framework Router with only the external model replaced locally."""
 
-    def __init__(
-        self,
-        env: RiskSharingEnv,
-        target_agent=None,
-        action: str = "read",
-    ):
-        super().__init__([env], max_steps=1)
-        self.environment = env
-        self.target_agent = target_agent
-        self.action = action
+    def __init__(self, env):
+        super().__init__([env], max_steps=4, max_llm_call_retry=1)
+        self.client = BudgetedClient(
+            ScriptedLLMClient("router"), RequestBudget(100), 512,
+            enforce_router_progression=True,
+        )
+        self._coder_dispatcher = self.client
+        self._summary_dispatcher = self.client
 
-    async def ask(self, ctx, instruction, **kwargs):
-        target = ctx["id"] if self.target_agent is None else self.target_agent
-        if self.action == "read":
-            result = await self._execute_tool(
-                "get_observation", {"agent_id": target}, readonly=True
-            )
-        else:
-            pair_id = self.environment.pair_by_agent[target]
-            decision_id = self.environment._decision_id(pair_id, target)
-            result = await self._execute_tool(
-                "submit_decision",
-                {
-                    "agent_id": target,
-                    "decision_id": decision_id,
-                    "decision_type": "transfer",
-                    "amount": 0,
-                },
-                readonly=False,
-            )
-        return result, "ok"
+    @property
+    def calls(self):
+        return self.client.actual_calls
 
 
 def test_initialization_pairing_and_reproducibility():
@@ -269,9 +253,7 @@ def test_missing_or_mismatched_caller_identity_is_rejected():
             call(env.submit_decision(env.partner_by_agent[high], decision_id, "transfer", 0))
 
 
-def test_router_dispatch_rejects_cross_pair_read_and_write_for_registered_target():
-    # This exercises the concrete ReActRouter dispatch component with a hand-
-    # written context; it is not a complete PersonAgent-to-Router integration.
+def test_adapter_uses_trusted_identity_through_real_router():
     env = RiskSharingEnv([1, 2, 3, 4], seed=10)
     caller, _ = high_and_low(env, 1)
     target, _ = high_and_low(env, 2)
@@ -280,99 +262,83 @@ def test_router_dispatch_rejects_cross_pair_read_and_write_for_registered_target
     context = {"id": caller, "agent_id": caller, "person_id": caller}
     target_pair = env.pair_by_agent[target]
     target_before = env.round_states[target_pair]
-    history_before = list(env.pair_history[target_pair])
-    receipts_before = dict(env._decision_receipts)
-
-    adapter = RiskSharingRouterAdapter(ReActDispatchProbe(env), env)
-    observation, answer = call(adapter.ask(context, "observe"))
-    assert answer == "ok"
+    router = OfflineRouter(env)
+    adapter = RiskSharingRouterAdapter(router, env)
+    response, answer = call(adapter.ask(context, "<observe>", readonly=True))
+    observation = response["get_observation"]
+    assert json.loads(answer) == observation
     assert observation["agent_id"] == caller
+    assert router.calls == 0
     with pytest.raises(PermissionError, match="No trusted caller"):
         call(env.get_observation(caller))
-
-    read_spoof = RiskSharingRouterAdapter(
-        ReActDispatchProbe(env, target_agent=target, action="read"), env
-    )
-    with pytest.raises(PermissionError, match="does not match"):
-        call(read_spoof.ask(context, "read target"))
-
-    write_spoof = RiskSharingRouterAdapter(
-        ReActDispatchProbe(env, target_agent=target, action="write"), env
-    )
-    with pytest.raises(PermissionError, match="does not match"):
-        call(write_spoof.ask(context, "write target"))
-    assert env.round_states[target_pair] == target_before
-    assert env.pair_history[target_pair] == history_before
-    assert env._decision_receipts == receipts_before
 
     with pytest.raises(PermissionError, match="must contain"):
-        call(adapter.ask({"id": caller}, "observe"))
+        call(adapter.ask({"id": caller}, "<observe>", readonly=True))
     with pytest.raises(PermissionError, match="agree"):
-        call(adapter.ask({"id": caller, "agent_id": target, "person_id": caller}, "observe"))
+        call(adapter.ask({"id": caller, "agent_id": target, "person_id": caller}, "<observe>", readonly=True))
     with pytest.raises(PermissionError, match="No trusted caller"):
         call(env.get_observation(caller))
+    assert env.round_states[target_pair] == target_before
+    assert router.calls == 0
 
 
-def test_router_adapter_cleanup_and_concurrent_contexts_are_isolated():
+def test_adapter_cleanup_and_concurrent_contexts_are_isolated():
     env = RiskSharingEnv([1, 2, 3, 4], seed=21)
     caller_a, _ = high_and_low(env, 1)
     caller_b, _ = high_and_low(env, 2)
     ctx_a = {"id": caller_a, "agent_id": caller_a, "person_id": caller_a}
     ctx_b = {"id": caller_b, "agent_id": caller_b, "person_id": caller_b}
-    adapter_a = RiskSharingRouterAdapter(ReActDispatchProbe(env), env)
-    adapter_b = RiskSharingRouterAdapter(ReActDispatchProbe(env), env)
+    router_a = OfflineRouter(env)
+    router_b = OfflineRouter(env)
+    adapter_a = RiskSharingRouterAdapter(router_a, env)
+    adapter_b = RiskSharingRouterAdapter(router_b, env)
 
     async def two_calls():
         return await asyncio.gather(
-            adapter_a.ask(ctx_a, "observe A"),
-            adapter_b.ask(ctx_b, "observe B"),
+            adapter_a.ask(ctx_a, "<observe>", readonly=True),
+            adapter_b.ask(ctx_b, "<observe>", readonly=True),
         )
 
     results = call(two_calls())
-    assert {result[0]["agent_id"] for result in results} == {caller_a, caller_b}
+    assert {result[0]["get_observation"]["agent_id"] for result in results} == {caller_a, caller_b}
+    assert router_a.calls == router_b.calls == 0
     with pytest.raises(PermissionError, match="No trusted caller"):
         call(env.get_observation(caller_a))
 
-    failing = RiskSharingRouterAdapter(
-        ReActDispatchProbe(env, target_agent=caller_b, action="read"), env
-    )
-    with pytest.raises(PermissionError, match="does not match"):
-        call(failing.ask(ctx_a, "raise"))
     with pytest.raises(PermissionError, match="No trusted caller"):
         call(env.get_observation(caller_b))
 
 
-def test_router_cannot_replace_participant_amount_with_fallback():
+def test_adapter_forwards_the_exact_participant_amount():
     env = RiskSharingEnv([1, 2], seed=22)
     high, _ = high_and_low(env)
     decision_id = observe(env, high)["decision_id"]
     context = {"id": high, "agent_id": high, "person_id": high}
-    adapter = RiskSharingRouterAdapter(
-        ReActDispatchProbe(env, target_agent=high, action="write"), env
-    )
+    router = OfflineRouter(env)
+    adapter = RiskSharingRouterAdapter(router, env)
     instruction = PARTICIPANT_DECISION_PREFIX + (
         '{"decision_type":"transfer","decision_id":"'
         + decision_id
         + '","amount":100}'
     )
 
-    with pytest.raises(PermissionError, match="exact decision"):
-        call(adapter.ask(context, instruction))
-    assert env.round_states[env.pair_by_agent[high]].transfer_amount == {}
-    assert env._decision_receipts == {}
+    response, _ = call(adapter.ask(context, instruction))
+    assert response["submit_decision"]["amount"] == 100
+    assert env.round_states[env.pair_by_agent[high]].transfer_amount[high] == 100
+    assert router.calls == 1
 
 
-def test_router_cannot_create_decision_without_participant_envelope():
+def test_adapter_rejects_economic_requests_without_participant_envelope():
     env = RiskSharingEnv([1, 2], seed=23)
     high, _ = high_and_low(env)
     context = {"id": high, "agent_id": high, "person_id": high}
-    adapter = RiskSharingRouterAdapter(
-        ReActDispatchProbe(env, target_agent=high, action="write"), env
-    )
+    router = OfflineRouter(env)
+    adapter = RiskSharingRouterAdapter(router, env)
 
-    with pytest.raises(PermissionError, match="without a participant model envelope"):
+    with pytest.raises(ValueError, match="Unsupported risk-sharing"):
         call(adapter.ask(context, "router-generated transfer"))
     assert env.round_states[env.pair_by_agent[high]].transfer_amount == {}
+    assert router.calls == 0
 
 
 def test_participant_decision_envelope_requires_all_economic_fields():
@@ -385,6 +351,78 @@ def test_participant_decision_envelope_requires_all_economic_fields():
         parse_participant_decision(
             PARTICIPANT_DECISION_PREFIX
             + '{"decision_type":"transfer","decision_id":"id","amount":1.0}'
+        )
+
+
+def test_participant_can_explain_a_choice_without_writing_json():
+    request = (
+        "I considered our previous transfers and my current income.\n"
+        "decision_type: transfer\ndecision_id: opaque-token\namount: 73"
+    )
+    assert parse_participant_decision(request) == {
+        "decision_type": "transfer", "decision_id": "opaque-token", "amount": 73,
+    }
+
+
+def test_participant_labels_can_share_a_line():
+    assert parse_participant_decision(
+        "I choose my transfer. decision_type: transfer decision_id: token amount: 73"
+    ) == {"decision_type": "transfer", "decision_id": "token", "amount": 73}
+
+
+@pytest.mark.parametrize("instruction", [
+    "Transfer {amount} to my partner.",
+    "decision_type: {decision_type}\ndecision_id: {decision_id}\namount: {amount}",
+    "decision_type: transfer decision_id: token amount: 73",
+])
+def test_explicit_participant_variables_are_read_without_inference(instruction):
+    decision = {"decision_type": "transfer", "decision_id": "token", "amount": 73}
+    assert parse_participant_decision(instruction, decision) == decision
+
+
+@pytest.mark.parametrize("amount", [True, False, 73.0, "73", None])
+def test_participant_variable_amount_must_be_a_typed_integer(amount):
+    with pytest.raises(ValueError, match="strict integer"):
+        parse_participant_decision(
+            "decision_type: transfer decision_id: token amount: {amount}",
+            {"amount": amount},
+        )
+
+
+def test_template_variables_do_not_supply_missing_or_conflicting_choices():
+    with pytest.raises(ValueError, match="must contain"):
+        parse_participant_decision("Transfer {amount}.", {"amount": 73})
+    with pytest.raises(ValueError, match="unresolved placeholder"):
+        parse_participant_decision(
+            "decision_type: transfer decision_id: token amount: {amount}"
+        )
+    with pytest.raises(ValueError, match="conflicts"):
+        parse_participant_decision(
+            "decision_type: transfer decision_id: token amount: 73", {"amount": 74}
+        )
+    # Natural-language intent alone is not permission for the Router to infer fields.
+    assert parse_participant_decision("I would like to transfer 73 to my partner.") is None
+
+
+@pytest.mark.parametrize("amount", ["1.5", "100 coins", "True", "1e2", "<your integer>"])
+def test_plain_text_choice_never_infers_or_rounds_an_amount(amount):
+    with pytest.raises(ValueError, match="strict integer"):
+        parse_participant_decision(
+            f"decision_type: transfer\ndecision_id: opaque-token\namount: {amount}"
+        )
+
+
+def test_plain_text_choice_requires_one_unambiguous_value_per_field():
+    with pytest.raises(ValueError, match="must contain"):
+        parse_participant_decision("decision_type: transfer\ndecision_id: opaque-token")
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_participant_decision(
+            "decision_type: transfer\ndecision_id: opaque-token\namount: 10\namount: 20"
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_participant_decision(
+            PARTICIPANT_DECISION_PREFIX
+            + '{"decision_type":"transfer","decision_id":"id","amount":10,"amount":20}'
         )
 
 

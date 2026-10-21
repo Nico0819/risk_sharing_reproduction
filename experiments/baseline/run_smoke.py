@@ -1,8 +1,8 @@
 """Run the Baseline participant smoke or full-session experiment.
 
-The scripted backend exercises the real PersonAgent -> adapter -> ReActRouter
--> tool -> RiskSharingEnv path without network access.  The deepseek backend
-uses the same wiring after loading the project-root .env.
+The scripted backend exercises the real PersonAgent -> participant model ->
+environment adapter -> ReActRouter -> RiskSharingEnv path without network access. The llm
+backend uses the same wiring after loading the project-root .env.
 """
 
 from __future__ import annotations
@@ -34,6 +34,9 @@ from custom.config import (  # noqa: E402
     load_runtime_config,
 )
 from protocol import paper_spec as protocol_spec  # noqa: E402
+
+
+DEFAULT_EXPERIMENT_TIMEOUT_SECONDS = 6 * 60 * 60
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -109,14 +112,31 @@ def _append_run_log(path: Path, event: str, **fields: Any) -> None:
     RunLogger(path, announce=False).write(event, **fields)
 
 
-class BudgetedClient:
-    """Apply run limits and optional bounded Router action progression.
+def _router_request(messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Read the adapter's explicit RPC; never derive an economic choice."""
 
-    The progression guard is deliberately small: after the Router receives a
-    current observation, it exposes only the action that is valid for that
-    observation. It does not manufacture a decision, choose an amount, or
-    call an environment method; the normal ReActRouter and adapter still do
-    all dispatch, identity, and validation work.
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, str):
+            continue
+        if "<risk_sharing_rpc>" not in content:
+            continue
+        raw = content.split("<risk_sharing_rpc>", 1)[1].split("</risk_sharing_rpc>", 1)[0]
+        request = json.loads(raw)
+        if (
+            isinstance(request, dict)
+            and request.get("tool") in {"get_observation", "submit_decision"}
+            and isinstance(request.get("arguments"), dict)
+        ):
+            return request
+    raise ValueError("Router requires an explicit request from the participant adapter.")
+
+
+class BudgetedClient:
+    """Apply run limits and bounded participant action progression.
+
+    The guard only constrains the participant model's available tools after
+    the initial observation. It never creates a decision or an amount.
     """
 
     def __init__(
@@ -125,195 +145,25 @@ class BudgetedClient:
         budget: RequestBudget,
         max_output_tokens: int,
         *,
-        enforce_router_progression: bool = False,
         enforce_participant_progression: bool = False,
+        enforce_router_progression: bool = False,
+        call_logger: RunLogger | None = None,
+        agent_id: int | None = None,
     ):
         self.inner = inner
         self.budget = budget
         self.max_output_tokens = max_output_tokens
         self.model_name = getattr(inner, "model_name", "")
-        self.enforce_router_progression = enforce_router_progression
         self.enforce_participant_progression = enforce_participant_progression
-        self._router_tool_schemas: list[dict[str, Any]] = []
+        self.enforce_router_progression = enforce_router_progression
+        self.actual_calls = 0
+        self.call_logger = call_logger
+        self.agent_id = agent_id
         self._participant_tool_schemas: list[dict[str, Any]] = []
-
-    @staticmethod
-    def _decode_tool_content(message: Any) -> dict[str, Any]:
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, str):
-            return {}
-        try:
-            value = json.loads(content)
-        except json.JSONDecodeError:
-            return {}
-        return value if isinstance(value, dict) else {}
-
-    @staticmethod
-    def _participant_decision(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """Read the participant-owned decision envelope from Router input."""
-
-        marker = "RISK_SHARING_PARTICIPANT_DECISION:"
-        for message in messages:
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, str) or marker not in content:
-                continue
-            raw = content.split(marker, 1)[1].split("\n", 1)[0].strip()
-            try:
-                value, _ = json.JSONDecoder().raw_decode(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict) and {"decision_type", "decision_id", "amount"}.issubset(value):
-                return value
-        return None
-
-    @staticmethod
-    def _router_caller_id(messages: list[dict[str, Any]]) -> int | None:
-        pattern = re.compile(r"id[^:]{0,3}:\s*(-?\d+)")
-        for message in messages:
-            content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, str):
-                match = pattern.search(content)
-                if match:
-                    return int(match.group(1))
-        return None
-
-    @staticmethod
-    def _prepared_router_tool(
-        tool: dict[str, Any],
-        *,
-        required_tool: str,
-        caller_id: int | None,
-        participant_decision: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        prepared = copy.deepcopy(tool)
-        function = prepared.setdefault("function", {})
-        parameters = function.setdefault("parameters", {})
-        properties = parameters.setdefault("properties", {})
-        required = list(parameters.get("required") or [])
-
-        if required_tool in {"get_observation", "submit_decision"}:
-            agent_schema = properties.setdefault("agent_id", {"type": "integer"})
-            agent_schema.update({"type": "integer"})
-            if caller_id is not None:
-                agent_schema["enum"] = [caller_id]
-            if "agent_id" not in required:
-                required.append("agent_id")
-
-        if required_tool == "submit_decision":
-            decision_schema = properties.setdefault(
-                "decision_type", {"type": "string"}
-            )
-            decision_schema.update({"type": "string", "enum": ["transfer"]})
-            if "decision_type" not in required:
-                required.append("decision_type")
-            if "decision_id" not in required:
-                required.append("decision_id")
-            if "amount" not in required:
-                required.append("amount")
-            if participant_decision is not None:
-                properties["decision_id"]["enum"] = [participant_decision["decision_id"]]
-                properties["decision_type"]["enum"] = [participant_decision["decision_type"]]
-                amount_schema = properties["amount"]
-                amount_schema.update({"type": "integer", "enum": [participant_decision["amount"]]})
-
-        parameters["required"] = required
-        return prepared
-
-    def _restrict_router_tools(self, messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> None:
-        """Constrain Router calls to the current observation/action state."""
-
-        if not self.enforce_router_progression:
-            return
-
-        advertised = kwargs.get("tools")
-        if advertised:
-            self._router_tool_schemas = [
-                tool for tool in advertised if isinstance(tool, dict)
-            ]
-        if not self._router_tool_schemas:
-            return
-
-        caller_id = self._router_caller_id(messages)
-        participant_decision = self._participant_decision(messages)
-        latest_tool = next(
-            (
-                message
-                for message in reversed(messages)
-                if isinstance(message, dict) and message.get("role") == "tool"
-            ),
-            None,
-        )
-
-        if latest_tool is None:
-            first_tool = [
-                self._prepared_router_tool(
-                    tool,
-                    required_tool="get_observation",
-                    caller_id=caller_id,
-                    participant_decision=participant_decision,
-                )
-                for tool in self._router_tool_schemas
-                if isinstance(tool.get("function"), dict)
-                and tool["function"].get("name") == "get_observation"
-            ]
-            if participant_decision is not None:
-                first_tool = [
-                    self._prepared_router_tool(
-                        tool,
-                        required_tool="submit_decision",
-                        caller_id=caller_id,
-                        participant_decision=participant_decision,
-                    )
-                    for tool in self._router_tool_schemas
-                    if isinstance(tool.get("function"), dict)
-                    and tool["function"].get("name") == "submit_decision"
-                ]
-            if first_tool:
-                kwargs["tools"] = first_tool
-                kwargs["tool_choice"] = "required"
-            return
-
-        latest_name = latest_tool.get("name")
-        observation = self._decode_tool_content(latest_tool)
-        if latest_name == "get_observation":
-            readonly = any(
-                isinstance(message.get("content"), str)
-                and "READONLY MODE" in message["content"]
-                for message in messages
-                if isinstance(message, dict)
-            )
-            if observation.get("error"):
-                required_tool = "get_observation"
-            elif readonly:
-                required_tool = "set_status"
-            elif observation.get("task") == "transfer":
-                required_tool = "submit_decision"
-            else:
-                required_tool = "set_status"
-        elif latest_name == "submit_decision":
-            # A failed submit may be corrected once with the same observation;
-            # a successful submit only needs the Router's normal completion.
-            required_tool = "submit_decision" if observation.get("error") else "set_status"
-        else:
-            return
-
-        restricted = [
-            self._prepared_router_tool(
-                tool,
-                required_tool=required_tool,
-                caller_id=caller_id,
-                participant_decision=participant_decision,
-            )
-            for tool in self._router_tool_schemas
-            if isinstance(tool.get("function"), dict)
-            and tool["function"].get("name") == required_tool
-        ]
-        if restricted:
-            kwargs["tools"] = restricted
-            kwargs["tool_choice"] = "required"
+        self._router_tool_schemas: list[dict[str, Any]] = []
 
     def _restrict_participant_tools(self, messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> None:
-        """Give each PersonAgent turn one environment action, then finish."""
+        """Allow a failed request to be corrected; finish after a receipt."""
 
         if not self.enforce_participant_progression:
             return
@@ -364,7 +214,10 @@ class BudgetedClient:
                 previous_args = {}
             if (
                 previous_function.get("name") == "ask_env"
-                and bool(previous_args.get("readonly"))
+                and (
+                    bool(previous_args.get("readonly"))
+                    or str(latest_tool.get("content", "")).startswith("ERROR:")
+                )
             ):
                 allowed_name = "ask_env"
             else:
@@ -415,15 +268,70 @@ class BudgetedClient:
         kwargs["tools"] = restricted
         kwargs["tool_choice"] = "auto" if allowed_name is None else "required"
 
+    def _restrict_router_tools(self, messages, kwargs) -> bool:
+        """Constrain routing and end completed RPCs without creating a decision."""
+
+        request = _router_request(messages)
+        advertised = kwargs.get("tools")
+        if advertised:
+            self._router_tool_schemas = advertised
+        for message in reversed(messages):
+            if message.get("role") != "tool" or message.get("name") != request["tool"]:
+                continue
+            try:
+                result = json.loads(message.get("content", ""))
+            except (TypeError, json.JSONDecodeError):
+                break
+            if isinstance(result, dict) and "error" not in result:
+                # This only terminates the Router loop after a real tool result.
+                # No amount, decision type or id is produced by this shortcut.
+                return True
+            break
+        tools = [
+            copy.deepcopy(tool) for tool in self._router_tool_schemas
+            if tool.get("function", {}).get("name") == request["tool"]
+        ]
+        if not tools:
+            raise ValueError("Router request does not match an allowed environment tool.")
+        properties = tools[0]["function"]["parameters"]["properties"]
+        for name, value in request["arguments"].items():
+            if name not in properties:
+                raise ValueError("Router request contains an unknown tool argument.")
+            properties[name]["enum"] = [value]
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "required"
+        return False
+
     async def call(self, model: str | None = None, messages=None, **kwargs: Any):
-        self.budget.reserve()
         messages = list(messages or [])
-        self._restrict_router_tools(messages, kwargs)
+        if self.enforce_router_progression and self._restrict_router_tools(messages, kwargs):
+            message = SimpleNamespace(content="Environment request completed.", tool_calls=[])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        self.budget.reserve()
+        request_index = self.budget.calls
+        self.actual_calls += 1
         self._restrict_participant_tools(messages, kwargs)
         kwargs.setdefault("max_output_tokens", self.max_output_tokens)
         # LLMClient clamps this to one actual attempt; no unbounded retry loop.
         kwargs["max_retries"] = 0
-        response = await self.inner.call(model=model, messages=messages, **kwargs)
+        started = time.monotonic()
+        error_type = None
+        try:
+            response = await self.inner.call(model=model, messages=messages, **kwargs)
+        except BaseException as exc:
+            error_type = type(exc).__name__
+            raise
+        finally:
+            if self.call_logger is not None:
+                self.call_logger.write(
+                    "model_call_finished",
+                    agent_id=self.agent_id,
+                    role="router" if self.enforce_router_progression else "participant",
+                    request_index=request_index,
+                    duration_seconds=round(time.monotonic() - started, 6),
+                    ok=error_type is None,
+                    error_type=error_type,
+                )
         self.budget.record_usage(response)
         return response
 
@@ -440,19 +348,11 @@ class ScriptedLLMClient:
     """Deterministic model boundary; it never performs network I/O."""
 
     def __init__(self, kind: str):
+        if kind not in {"participant", "router"}:
+            raise ValueError("scripted client kind must be participant or router")
         self.kind = kind
         self.model_name = "scripted-model"
         self.calls = 0
-
-    @staticmethod
-    def _tool_names(tools: Any) -> set[str]:
-        names: set[str] = set()
-        for tool in tools or []:
-            try:
-                names.add(str(tool["function"]["name"]))
-            except (KeyError, TypeError):
-                continue
-        return names
 
     @staticmethod
     def _tool_call(name: str, arguments: dict[str, Any], index: int) -> Any:
@@ -471,15 +371,6 @@ class ScriptedLLMClient:
     @staticmethod
     def _tool_messages(messages: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         return [m for m in messages if m.get("role") == "tool"]
-
-    @staticmethod
-    def _decode_tool_content(message: dict[str, Any]) -> dict[str, Any]:
-        raw = message.get("content") or "{}"
-        try:
-            value = json.loads(raw)
-            return value if isinstance(value, dict) else {}
-        except (TypeError, json.JSONDecodeError):
-            return {}
 
     @staticmethod
     def _participant_turn(messages: Iterable[dict[str, Any]]) -> tuple[int, dict[str, Any]] | None:
@@ -518,156 +409,67 @@ class ScriptedLLMClient:
         proposed = 13 + agent_id * 17
         return min(upper, proposed)
 
-    @staticmethod
-    def _participant_decision(messages: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
-        marker = "RISK_SHARING_PARTICIPANT_DECISION:"
-        for message in messages:
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, str) or marker not in content:
-                continue
-            raw = content.split(marker, 1)[1].split("\n", 1)[0].strip()
-            try:
-                value, _ = json.JSONDecoder().raw_decode(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                return value
-        return None
-
-    @staticmethod
-    def _caller_id(messages: Iterable[dict[str, Any]]) -> int:
-        """Read the framework identity from ReActRouter's initial ctx text.
-
-        The adapter remains the authority: this value is only used to make a
-        deterministic model response, while the adapter validates it against
-        PersonAgent's trusted context before dispatch.
-        """
-
-        pattern = re.compile(r"['\"]id['\"]\s*[:=]\s*(-?\d+)")
-        for message in messages:
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, str):
-                continue
-            match = pattern.search(content)
-            if match:
-                return int(match.group(1))
-        raise RuntimeError("scripted router could not recover the framework caller id")
-
     async def call(self, model: str | None = None, messages=None, **kwargs: Any) -> Any:
         self.calls += 1
         messages = list(messages or [])
-        tools = kwargs.get("tools")
-        names = self._tool_names(tools)
         tool_messages = self._tool_messages(messages)
-        if self.kind == "summary":
+        if self.kind == "router":
+            request = _router_request(messages)
             return self._response(
-                content=json.dumps(
-                    {"status": "success", "summary": "已完成环境请求。"},
-                    ensure_ascii=False,
-                )
+                name=request["tool"], arguments=copy.deepcopy(request["arguments"])
             )
-        caller_id = self._caller_id(messages) if self.kind == "router" else None
-        readonly_request = any(
-            isinstance(m.get("content"), str) and "READONLY MODE" in m["content"]
-            for m in messages
-            if isinstance(m, dict)
-        )
-
-        if self.kind == "participant":
-            if tool_messages:
-                return self._response(
-                    name="finish",
-                    arguments={
-                        "final": "本轮行动已完成。",
-                        "memories": [
-                            {
-                                "type": "observation",
-                                "importance": 0.1,
-                                "keywords": ["risk_sharing"],
-                                "text": "完成本轮环境观察与合法行动。",
-                                "source": "step_result",
-                                "refs": [],
-                            }
-                        ],
-                    },
-                )
-            participant_turn = self._participant_turn(messages)
-            if participant_turn is None:
-                return self._response(
-                    name="ask_env",
-                    arguments={
-                        "instruction": "没有可用 observation；请先通过环境读取当前 observation。",
-                        "readonly": False,
-                    },
-                )
-            participant_id, observation = participant_turn
-            if observation.get("task") != "transfer":
-                return self._response(
-                    name="finish",
-                    arguments={
-                        "final": "没有转账机会，本轮等待。",
-                        "memories": [{"text": "等待", "type": "observation"}],
-                    },
-                )
-            decision = {
-                "decision_type": "transfer",
-                "decision_id": observation.get("decision_id"),
-                "amount": self._participant_amount(participant_id, observation),
-            }
+        if tool_messages and not str(tool_messages[-1].get("content", "")).startswith("ERROR:"):
+            return self._response(
+                name="finish",
+                arguments={
+                    "final": "本轮行动已完成。",
+                    "memories": [
+                        {
+                            "type": "observation",
+                            "importance": 0.1,
+                            "keywords": ["risk_sharing"],
+                            "text": "完成本轮环境观察与合法行动。",
+                            "source": "step_result",
+                            "refs": [],
+                        }
+                    ],
+                },
+            )
+        participant_turn = self._participant_turn(messages)
+        if participant_turn is None:
             return self._response(
                 name="ask_env",
                 arguments={
-                    "instruction": "RISK_SHARING_PARTICIPANT_DECISION:"
-                    + json.dumps(decision, ensure_ascii=False, separators=(",", ":")),
+                    "instruction": "没有可用 observation；请先通过环境读取当前 observation。",
                     "readonly": False,
                 },
             )
-
-        # ReActRouter's first request advertises environment tools.  Subsequent
-        # requests omit schemas but retain named tool result messages.
-        participant_decision = self._participant_decision(messages)
-        if not tool_messages and participant_decision is not None and "submit_decision" in names:
+        participant_id, observation = participant_turn
+        if observation.get("task") != "transfer":
             return self._response(
-                name="submit_decision",
+                name="finish",
                 arguments={
-                    "agent_id": caller_id,
-                    "decision_id": participant_decision["decision_id"],
-                    "decision_type": participant_decision["decision_type"],
-                    "amount": participant_decision["amount"],
+                    "final": "没有转账机会，本轮等待。",
+                    "memories": [{"text": "等待", "type": "observation"}],
                 },
             )
-        if not tool_messages and "get_observation" in names:
-            return self._response(name="get_observation", arguments={"agent_id": caller_id})
-        if tool_messages:
-            last = tool_messages[-1]
-            last_name = str(last.get("name") or "")
-            value = self._decode_tool_content(last)
-            if last_name == "get_observation":
-                if (not readonly_request) and participant_decision is not None:
-                    return self._response(
-                        name="submit_decision",
-                        arguments={
-                            "agent_id": caller_id,
-                            "decision_id": participant_decision["decision_id"],
-                            "decision_type": participant_decision["decision_type"],
-                            "amount": participant_decision["amount"],
-                        },
-                    )
-                if (not readonly_request) and value.get("task") == "transfer":
-                    return self._response(content="participant decision missing")
-                if readonly_request:
-                    return self._response(content="observation returned")
-                return self._response(
-                    name="set_status",
-                    arguments={"status": "success", "reason": "waiting"},
-                )
-            if last_name in {"submit_decision", "set_status"}:
-                if last_name == "submit_decision":
-                    return self._response(content="decision forwarded")
-                return self._response(content="environment request completed")
-            if value.get("error"):
-                return self._response(content="environment request failed")
-        return self._response(content="environment request completed")
+        decision = {
+            "decision_type": "transfer",
+            "decision_id": observation.get("decision_id"),
+            "amount": self._participant_amount(participant_id, observation),
+        }
+        return self._response(
+            name="ask_env",
+            arguments={
+                "instruction": (
+                    "I have chosen this transfer using my current observation.\n"
+                    f"decision_type: {decision['decision_type']}\n"
+                    f"decision_id: {decision['decision_id']}\n"
+                    f"amount: {decision['amount']}"
+                ),
+                "readonly": False,
+            },
+        )
 
 
 def _jsonl_append(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -728,10 +530,12 @@ def _safe_action_records(
         }
         if function_name == "get_observation":
             row["observation"] = record.get("return_value")
-            row["router_action"] = "get_observation"
-            row["decision_source"] = "router_tool_routing"
+            row["router_action"] = "direct_observation"
+            row["router_model_called"] = False
+            row["decision_source"] = "participant_observation_request"
         elif function_name == "submit_decision":
-            row["router_action"] = "submit_decision"
+            row["router_action"] = "router_forward"
+            row["router_model_called"] = True
             row["submitted_amount"] = kwargs.get("amount")
             row["decision_id"] = kwargs.get("decision_id")
             row["receipt"] = record.get("return_value")
@@ -742,6 +546,8 @@ def _safe_action_records(
                     for item in participant_decisions
                     if item.get("agent_id") == agent_id
                     and item.get("decision_id") == kwargs.get("decision_id")
+                    and item.get("decision_type") == kwargs.get("decision_type")
+                    and item.get("amount") == kwargs.get("amount")
                 ),
                 None,
             )
@@ -758,8 +564,12 @@ def _safe_action_records(
                         "contains_observation": True,
                     }
                 row["participant_amount"] = participant.get("amount")
+                row["participant_raw_request"] = _redact_text(participant.get("raw_request", ""))
+                row["participant_variables"] = _safe_log_value(
+                    participant.get("participant_variables", {})
+                )
             else:
-                row["decision_source"] = "router_or_unknown"
+                row["decision_source"] = "unknown_without_participant_record"
         if record.get("exception_occurred"):
             row["error"] = record.get("exception_info")
         safe.append(row)
@@ -778,6 +588,7 @@ async def _run_async(
     max_output_tokens: int,
     router_steps: int,
     agent_turns: int,
+    agent_concurrency: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     run_log = RunLogger(run_dir / "run.log")
@@ -790,6 +601,7 @@ async def _run_async(
         full_session=full_session,
         request_limit=request_limit,
         max_output_tokens=max_output_tokens,
+        agent_concurrency=agent_concurrency,
         timeout_seconds=timeout_seconds,
     )
 
@@ -804,14 +616,17 @@ async def _run_async(
     from agentsociety2.agent.service_proxy import LLMClients, ServiceProxy
     from agentsociety2.agent.runner import _step_agent_batch_async
     from agentsociety2.config.llm_dispatcher import build_client_for_role
-    from agentsociety2.env import ReActRouter
     from custom.agents.risk_sharing_participant import RiskSharingParticipant
-    from custom.envs.risk_sharing_env import RiskSharingEnv, RiskSharingRouterAdapter
+    from custom.envs.risk_sharing_env import (
+        RiskSharingEnv, RiskSharingReActRouter, RiskSharingRouterAdapter,
+    )
 
     if participants != 4:
         raise ValueError("this smoke entry is fixed to four participants / two pairs")
     if completed_period_limit < 1:
         raise ValueError("completed_period_limit must be positive")
+    if not 1 <= agent_concurrency <= participants:
+        raise ValueError("agent_concurrency must be between 1 and participants")
 
     budget = RequestBudget(max_calls=request_limit)
     env = RiskSharingEnv(
@@ -819,30 +634,63 @@ async def _run_async(
         seed=seed,
         session_id=f"smoke-{uuid.uuid4().hex}",
     )
-    router = ReActRouter([env], max_steps=router_steps, max_llm_call_retry=1)
-    if cfg.backend == "scripted":
-        router_client = BudgetedClient(ScriptedLLMClient("router"), budget, max_output_tokens, enforce_router_progression=True)
-        summary_client = BudgetedClient(ScriptedLLMClient("summary"), budget, max_output_tokens)
-        participant_client = BudgetedClient(ScriptedLLMClient("participant"), budget, max_output_tokens, enforce_participant_progression=True)
-    else:
-        router_client = BudgetedClient(build_client_for_role("coder"), budget, max_output_tokens, enforce_router_progression=True)
-        summary_client = BudgetedClient(build_client_for_role("default"), budget, max_output_tokens)
-        participant_client = BudgetedClient(build_client_for_role("default"), budget, max_output_tokens, enforce_participant_progression=True)
-    router._coder_dispatcher = router_client
-    router._summary_dispatcher = summary_client
-    adapter = RiskSharingRouterAdapter(router, env)
-    proxy = ServiceProxy(
-        env=adapter,
-        llm=LLMClients(coder=router_client, default=participant_client, embedding=None),
-        trace=None,
-        replay=None,
-        run_dir=run_dir,
-    )
+    participant_clients: list[BudgetedClient] = []
+    router_clients: list[BudgetedClient] = []
+
+    call_log = RunLogger(run_dir / "run.log", announce=False)
+
+    def _make_agent_services(agent_id: int) -> tuple[RiskSharingRouterAdapter, ServiceProxy]:
+        """Give each participant its own model clients and trusted Router adapter."""
+
+        router = RiskSharingReActRouter([env], max_steps=router_steps, max_llm_call_retry=1)
+        if cfg.backend == "scripted":
+            participant_inner = ScriptedLLMClient("participant")
+            router_inner = ScriptedLLMClient("router")
+        else:
+            participant_inner = build_client_for_role("default")
+            router_inner = build_client_for_role("coder")
+        participant_client = BudgetedClient(
+            participant_inner, budget, max_output_tokens,
+            enforce_participant_progression=True,
+            call_logger=call_log, agent_id=agent_id,
+        )
+        router_client = BudgetedClient(
+            router_inner, budget, max_output_tokens,
+            enforce_router_progression=True,
+            call_logger=call_log, agent_id=agent_id,
+        )
+        participant_clients.append(participant_client)
+        router_clients.append(router_client)
+        router._coder_dispatcher = router_client
+        router._summary_dispatcher = router_client
+        adapter = RiskSharingRouterAdapter(router, env)
+        proxy = ServiceProxy(
+            env=adapter,
+            llm=LLMClients(coder=None, default=participant_client, embedding=None),
+            trace=None,
+            replay=None,
+            run_dir=run_dir,
+        )
+        return adapter, proxy
+
+    agent_services = {
+        agent_id: _make_agent_services(agent_id)
+        for agent_id in range(1, participants + 1)
+    }
+    # All adapters point at the same RiskSharingEnv.  Use one only for the
+    # scheduler's current-time/settlement calls; participant calls use their
+    # own adapter and participant model client.
+    control_adapter = agent_services[1][0]
     run_log.write(
         "framework_ready",
         router="ReActRouter",
+        router_model=cfg.model,
+        router_api_enabled=cfg.backend == "llm",
+        router_model_requests=0,
         agent_class="RiskSharingParticipant",
         pairs=len(env.pair_members),
+        agent_concurrency=agent_concurrency,
+        isolated_participant_clients=participants,
     )
 
     workspace_root = run_dir / "agents"
@@ -881,6 +729,21 @@ async def _run_async(
     )
     started = time.monotonic()
     participant_decision_cursor = 0
+    participant_rejection_cursor = 0
+    agent_semaphore = asyncio.Semaphore(agent_concurrency)
+
+    async def _step_one_agent(agent_id: int) -> list[dict[str, Any]]:
+        async with agent_semaphore:
+            _adapter, proxy = agent_services[agent_id]
+            return await _step_agent_batch_async(
+                [agent_id],
+                str(workspace_root),
+                "RiskSharingParticipant",
+                scheduler_steps,
+                now,
+                proxy,
+            )
+
     while (not env.finished) if full_session else (len(env.completed_periods) < completed_period_limit):
         if scheduler_steps >= max_scheduler_steps:
             stop_reason = "scheduler_step_limit"
@@ -893,33 +756,31 @@ async def _run_async(
             current_period=env.current_period,
             completed_periods=list(env.completed_periods),
         )
-        adapter.set_current_time(now)
-        # The framework runner is still used for every PersonAgent; the
-        # scripted model boundary is kept sequential so its deterministic
-        # response cannot mix two concurrent ReAct conversations.
-        batch = []
-        for agent_id in range(1, participants + 1):
-            batch.extend(
-                await _step_agent_batch_async(
-                    [agent_id],
-                    str(workspace_root),
-                    "RiskSharingParticipant",
-                    scheduler_steps,
-                    now,
-                    proxy,
-                )
-            )
+        for adapter, _proxy in agent_services.values():
+            adapter.set_current_time(now)
+        # Run PersonAgents concurrently up to the configured bound.  The
+        # gather is a barrier: env.step() below still settles only after every
+        # participant has finished this period's action.
+        batches = await asyncio.gather(
+            *(_step_one_agent(agent_id) for agent_id in range(1, participants + 1))
+        )
+        batch = [item for agent_batch in batches for item in agent_batch]
         result_batches.extend(batch)
-        participant_decisions = adapter.participant_decisions[
+        participant_decisions = control_adapter.participant_decisions[
             participant_decision_cursor:
         ]
-        participant_decision_cursor = len(adapter.participant_decisions)
+        participant_decision_cursor = len(control_adapter.participant_decisions)
         step_actions = _safe_action_records(
             env.get_tool_call_history()[start_history:],
             env,
             scheduler_steps,
             participant_decisions,
         )
+        step_actions.extend(
+            _safe_log_value({"framework_step": scheduler_steps, **row})
+            for row in control_adapter.participant_rejections[participant_rejection_cursor:]
+        )
+        participant_rejection_cursor = len(control_adapter.participant_rejections)
         _jsonl_append(action_path, step_actions)
         run_log.write(
             "tool_actions",
@@ -961,7 +822,7 @@ async def _run_async(
             break
         before = len(env.completed_periods)
         period_before = env.current_period
-        await adapter.step(1, now)
+        await control_adapter.step(1, now)
         after = len(env.completed_periods)
         run_log.write(
             "scheduler_step_finished",
@@ -1051,6 +912,13 @@ async def _run_async(
         "run_mode": "full_session" if full_session else "smoke",
         "backend": cfg.backend,
         "router": "ReActRouter",
+        "router_model": cfg.model,
+        "router_api_enabled": cfg.backend == "llm",
+        "observation_routing": "direct_via_trusted_adapter",
+        "transfer_routing": "react_router",
+        "finish_after_receipt": "local",
+        "router_model_requests": sum(client.actual_calls for client in router_clients),
+        "participant_model_requests": sum(client.actual_calls for client in participant_clients),
         "agent_class": "RiskSharingParticipant",
         "agents": participants,
         "pairs": len(env.pair_members),
@@ -1062,6 +930,7 @@ async def _run_async(
         "max_output_tokens": max_output_tokens,
         "router_max_steps": router_steps,
         "agent_max_turns": agent_turns,
+        "agent_concurrency": agent_concurrency,
         "actual_model_requests": budget.calls,
         "actual_input_tokens": budget.input_tokens,
         "actual_output_tokens": budget.output_tokens,
@@ -1086,6 +955,11 @@ async def _run_async(
         f"- stop_reason: `{stop_reason}`",
         f"- completed_periods: `{env.completed_periods}`",
         f"- model_requests: `{budget.calls}/{request_limit}`",
+        f"- participant_model_requests: `{sum(client.actual_calls for client in participant_clients)}`",
+        f"- router_model_requests: `{sum(client.actual_calls for client in router_clients)}`",
+        "- observation_routing: `direct_via_trusted_adapter`",
+        "- finish_after_receipt: `local`",
+        f"- agent_concurrency: `{agent_concurrency}`",
         f"- output_tokens: `{budget.output_tokens}`",
         "",
         "## Pair-period settlements",
@@ -1131,6 +1005,8 @@ async def _run_async(
         stop_reason=stop_reason,
         completed_periods=list(env.completed_periods),
         model_requests=budget.calls,
+        router_model_requests=sum(client.actual_calls for client in router_clients),
+        participant_model_requests=sum(client.actual_calls for client in participant_clients),
         failure_details=failure_details,
     )
     (run_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
@@ -1148,6 +1024,9 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
     )
     run_dir = _make_run_dir(kwargs.get("run_dir"))
     try:
+        timeout_seconds = float(
+            kwargs.get("timeout_seconds", DEFAULT_EXPERIMENT_TIMEOUT_SECONDS)
+        )
         coro = _run_async(
             cfg=cfg,
             participants=int(kwargs.get("participants", 4)),
@@ -1159,9 +1038,10 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             max_output_tokens=int(kwargs.get("max_output_tokens", 2048)),
             router_steps=int(kwargs.get("router_steps", 6)),
             agent_turns=int(kwargs.get("agent_turns", 4)),
-            timeout_seconds=float(kwargs.get("timeout_seconds", 900.0)),
+            agent_concurrency=int(kwargs.get("agent_concurrency", 1)),
+            timeout_seconds=timeout_seconds,
         )
-        return asyncio.run(asyncio.wait_for(coro, timeout=float(kwargs.get("timeout_seconds", 900.0))))
+        return asyncio.run(asyncio.wait_for(coro, timeout=timeout_seconds))
     except Exception as exc:
         safe_error = _redact_text(exc)
         _append_run_log(
@@ -1190,7 +1070,7 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("scripted", "deepseek"), required=True)
+    parser.add_argument("--backend", choices=("scripted", "llm"), required=True)
     parser.add_argument("--participants", type=int, default=4)
     parser.add_argument(
         "--completed-period-limit",
@@ -1209,7 +1089,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-output-tokens", type=int, default=2048)
     parser.add_argument("--router-max-steps", type=int, default=6)
     parser.add_argument("--agent-max-turns", type=int, default=4)
-    parser.add_argument("--timeout-seconds", type=float, default=900.0)
+    parser.add_argument(
+        "--agent-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of participant Agents stepped concurrently per "
+            "period (default: 1; use 4 for all four Agents)."
+        ),
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_EXPERIMENT_TIMEOUT_SECONDS,
+        help="Whole-experiment time limit in seconds (default: 21600, or 6 hours).",
+    )
     parser.add_argument("--request-timeout", type=float, default=60.0)
     return parser
 
@@ -1225,7 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeConfigError as exc:
         print(f"配置未就绪：{exc}", file=sys.stderr)
         return 2
-    print(json.dumps({"config": cfg.safe_status(), "limits": {"requests": args.request_limit, "max_output_tokens": args.max_output_tokens, "timeout_seconds": args.timeout_seconds, "full_session": args.full_session}}, ensure_ascii=False))
+    print(json.dumps({"config": cfg.safe_status(), "limits": {"requests": args.request_limit, "max_output_tokens": args.max_output_tokens, "timeout_seconds": args.timeout_seconds, "full_session": args.full_session, "agent_concurrency": args.agent_concurrency}}, ensure_ascii=False))
     try:
         manifest = run_experiment(
             backend=args.backend,
@@ -1238,6 +1132,7 @@ def main(argv: list[str] | None = None) -> int:
             max_output_tokens=args.max_output_tokens,
             router_steps=args.router_max_steps,
             agent_turns=args.agent_max_turns,
+            agent_concurrency=args.agent_concurrency,
             timeout_seconds=args.timeout_seconds,
             request_timeout=args.request_timeout,
         )
