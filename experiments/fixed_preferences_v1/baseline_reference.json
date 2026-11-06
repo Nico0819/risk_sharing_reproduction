@@ -1,0 +1,32 @@
+{
+  "description": "Existing working-tree source hashes at creation; the new runner is copied from baseline/run_smoke.py, while environment and framework adapters are reused.",
+  "files": {
+    ".gitignore": "5a4f8502d8cf8593b8d43adeac4f5e8dccf0d6989634a42e1a12afdf9fb10a79",
+    "README.md": "6bee631293aa8fcb832d0e87326d1d5f033f280aee36be99019069cb0277423e",
+    "custom/agents/risk_sharing_deliberation.md": "53bd5d916336f0684371d8727f8b0c9442997e8bdb58d231885d2450d1e571f2",
+    "custom/agents/risk_sharing_insurance.md": "fe15e6daad89cff5b91b306f3133b41767550b056f6874d80be360ba4576cb8a",
+    "custom/agents/risk_sharing_participant.md": "a2147453dc0ae81cbda0b45ea9c11856387d5cacff980df0a5fe27005b88dfc4",
+    "custom/agents/risk_sharing_participant.py": "21d26adcd27537d270c2866cd6a3aa6d2010bf680af589989b9ef851d6e1951e",
+    "custom/config.py": "4f20670a448ee04741eb3c161a6cb4a860c42097fe45c36314eb8b490585d048",
+    "custom/envs/risk_sharing_env.py": "a28ed5274c039515a781e6dc4bb63138a7e5af195db96c2bf77dfaa14ddaac86",
+    "custom/insurance_assignment.py": "5e9771a210d4db7da2b9d7cb013a128e895c7d9366c2ee3e29682e698e40bb43",
+    "experiments/25f/run_smoke.py": "546bf44315563b0d94c33ed7445cb1abcb55118d12cfcfbde8280ddd3ab31d3c",
+    "experiments/25v/run_smoke.py": "69c689fbd9c3093556515d519f386ee4ec06e8b76ece6bceffec50680b710f54",
+    "experiments/baseline/run_smoke.py": "d929fbc2b6640fa3eaa7ce25cb665a09fde4134bf0f13c5d5b1c83a8cf93c209",
+    "experiments/report.py": "8461c1b6199d2c79772a2b672eec2eff1d9bc5ff2d4d5329136dcfe8fe82d694",
+    "experiments/report_data.py": "081ff3f88f8e2a18961d5bf4ca19d6dd3369991a314310a421b353085ade3a2b",
+    "experiments/report_template.html": "ae2b9f4fbb697ff253cacd812d47aea9fd2fa33de7258851837efe6f8f7da278",
+    "protocol/paper_spec.py": "11e0f3b2be99815b082109d19830b5b7e45c469dffd27f788bdc3f9c4c6cb718",
+    "tests/test_25f.py": "cc1644c14d784b620b500b0827adf69924c561465a46826cfc773d7e1e3153ea",
+    "tests/test_25v.py": "bba970025129000df324cdbbfb8d5f1ff2b5bbcf32d1cd61234537e0c09b71f5",
+    "tests/test_agent_communication_boundaries.py": "fddbcafd627edcf6418fc275ddb26ca2d9a11e218c4990ed224c54afe8d14ab9",
+    "tests/test_baseline_integration.py": "0c6310da24975e4387c19e4afedab4d24533cba19e821027a02009f81e905055",
+    "tests/test_paper_spec.py": "d1b431b08a4799b6c25c1a45ba00463a1e52e57b826b2058670e7aa9317f52b1",
+    "tests/test_participant_deliberation.py": "fad0127b0f39772d0464b8e7c8e7b79bf329a5054a59bfd21081d45ec17d0031",
+    "tests/test_report_data.py": "dbef982d9e516aca5f188f179a2e87842b98a822f3d52f5e49b42197e8200085",
+    "tests/test_report_data_25f.py": "d377ad67e9d577cc48cac045b84f954114bd17b9b340b41d1f7ec377cd7e2eb3",
+    "tests/test_risk_sharing_env.py": "b832527582190d360c46556e048efb0824f8d23263a021ed9482adf337d8fc54",
+    "tests/test_visual_report.py": "1cf6f0ac9a113137ee37ddf79fc40ec20908022ec4cb668fdfc48dd3eaa42fba",
+    "tests/test_visual_report_25f.py": "add0531be587150fbb9b5f0354ef6c44d2604671e5a00993acff9f59716e77f5"
+  }
+}

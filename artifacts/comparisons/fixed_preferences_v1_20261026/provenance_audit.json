@@ -1,0 +1,501 @@
+{
+  "runs": {
+    "baseline": {
+      "run_dir": "experiments/fixed_preferences_v1/runs/baseline/20261025T134921Z-99290f7f",
+      "config": {
+        "success": true,
+        "stop_reason": "natural_termination",
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "participant_model_requests": 984,
+        "router_model_requests": 480,
+        "failure_details": [],
+        "agent_concurrency": 20,
+        "seed": 2026,
+        "prompt_sha256": "3c681ec0c6608513cb3259061500c03077c53bfd8b42139417585773375ffdfc",
+        "preferences_sha256": "75bdc98b88945880a16a5dbebdc282c17a399d7653867ba8494e42bf0417e3c3",
+        "max_output_tokens": 2048,
+        "router_max_steps": 4,
+        "agent_max_turns": 4,
+        "participant_deliberation": false
+      },
+      "context_rows": 984,
+      "new_prompt_in_all_contexts": true,
+      "current_base_prompt_in_all_contexts": true,
+      "errors": {},
+      "accepted_transfers": 480,
+      "unique_pair_periods": 480,
+      "actions": {
+        "get_observation": 980,
+        "submit_decision": 480,
+        "participant_decision_rejected": 1
+      },
+      "failed_actions": {
+        "participant_decision_rejected": 1
+      },
+      "failed_action_details": [
+        {
+          "line": 931,
+          "agent_id": 8,
+          "step": 31,
+          "action": "participant_decision_rejected",
+          "error": "No explicit decision fields were found in your request. Use the specified decision fields; if your task is waiting, use finish."
+        }
+      ],
+      "model_call_failures": [],
+      "run_events": {
+        "run_started": 1,
+        "configuration_loaded": 1,
+        "framework_ready": 1,
+        "scheduler_step_started": 49,
+        "model_call_finished": 1464,
+        "tool_actions": 49,
+        "agent_result": 980,
+        "scheduler_step_finished": 49,
+        "payment_selected": 1,
+        "run_finished": 1
+      },
+      "scheduler_steps": 49,
+      "periods_with_multiple_scheduler_steps": {
+        "43": 2
+      },
+      "extra_participant_calls_over_expected": 24,
+      "phase_means": [
+        {
+          "periods": [
+            1,
+            15
+          ],
+          "mean": 85.16666666666667,
+          "n": 150
+        },
+        {
+          "periods": [
+            16,
+            30
+          ],
+          "mean": 88.66666666666667,
+          "n": 150
+        },
+        {
+          "periods": [
+            31,
+            45
+          ],
+          "mean": 89,
+          "n": 150
+        },
+        {
+          "periods": [
+            46,
+            48
+          ],
+          "mean": 89,
+          "n": 30
+        }
+      ],
+      "first_context_lines": {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 12,
+        "13": 13,
+        "14": 14,
+        "15": 15,
+        "16": 16,
+        "17": 17,
+        "18": 18,
+        "19": 19,
+        "20": 20
+      }
+    },
+    "25V": {
+      "run_dir": "experiments/fixed_preferences_v1/runs/25v/20261025T145836Z-65a997b1",
+      "config": {
+        "success": true,
+        "stop_reason": "natural_termination",
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "participant_model_requests": 989,
+        "router_model_requests": 500,
+        "failure_details": [],
+        "agent_concurrency": 20,
+        "seed": 2026,
+        "prompt_sha256": "3c681ec0c6608513cb3259061500c03077c53bfd8b42139417585773375ffdfc",
+        "preferences_sha256": "75bdc98b88945880a16a5dbebdc282c17a399d7653867ba8494e42bf0417e3c3",
+        "max_output_tokens": 2048,
+        "router_max_steps": 4,
+        "agent_max_turns": 4,
+        "participant_deliberation": false
+      },
+      "context_rows": 989,
+      "new_prompt_in_all_contexts": true,
+      "current_base_prompt_in_all_contexts": true,
+      "errors": {},
+      "accepted_transfers": 480,
+      "unique_pair_periods": 480,
+      "actions": {
+        "get_observation": 980,
+        "submit_decision": 480,
+        "participant_decision_rejected": 3,
+        "submit_insurance_decision": 20
+      },
+      "failed_actions": {
+        "participant_decision_rejected": 3
+      },
+      "failed_action_details": [
+        {
+          "line": 301,
+          "agent_id": 20,
+          "step": 10,
+          "action": "participant_decision_rejected",
+          "error": "No explicit decision fields were found in your request. Use the specified decision fields; if your task is waiting, use finish."
+        },
+        {
+          "line": 762,
+          "agent_id": 6,
+          "step": 25,
+          "action": "participant_decision_rejected",
+          "error": "No explicit decision fields were found in your request. Use the specified decision fields; if your task is waiting, use finish."
+        },
+        {
+          "line": 913,
+          "agent_id": 2,
+          "step": 30,
+          "action": "participant_decision_rejected",
+          "error": "No explicit decision fields were found in your request. Use the specified decision fields; if your task is waiting, use finish."
+        }
+      ],
+      "model_call_failures": [],
+      "run_events": {
+        "run_started": 1,
+        "configuration_loaded": 1,
+        "framework_ready": 1,
+        "scheduler_step_started": 49,
+        "model_call_finished": 1489,
+        "tool_actions": 49,
+        "agent_result": 980,
+        "scheduler_step_finished": 49,
+        "payment_selected": 1,
+        "run_finished": 1
+      },
+      "scheduler_steps": 49,
+      "periods_with_multiple_scheduler_steps": {
+        "16": 2
+      },
+      "extra_participant_calls_over_expected": 9,
+      "phase_means": [
+        {
+          "periods": [
+            1,
+            15
+          ],
+          "mean": 85.03333333333333,
+          "n": 150
+        },
+        {
+          "periods": [
+            16,
+            30
+          ],
+          "mean": 83.36,
+          "n": 150
+        },
+        {
+          "periods": [
+            31,
+            45
+          ],
+          "mean": 86.63333333333334,
+          "n": 150
+        },
+        {
+          "periods": [
+            46,
+            48
+          ],
+          "mean": 86.5,
+          "n": 30
+        }
+      ],
+      "first_context_lines": {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 12,
+        "13": 13,
+        "14": 14,
+        "15": 15,
+        "16": 16,
+        "17": 17,
+        "18": 18,
+        "19": 19,
+        "20": 20
+      }
+    },
+    "25F": {
+      "run_dir": "experiments/fixed_preferences_v1/runs/25f/20261026T032217Z-54514d0b",
+      "config": {
+        "success": true,
+        "stop_reason": "natural_termination",
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "participant_model_requests": 983,
+        "router_model_requests": 480,
+        "failure_details": [],
+        "agent_concurrency": 20,
+        "seed": 2026,
+        "prompt_sha256": "3c681ec0c6608513cb3259061500c03077c53bfd8b42139417585773375ffdfc",
+        "preferences_sha256": "75bdc98b88945880a16a5dbebdc282c17a399d7653867ba8494e42bf0417e3c3",
+        "max_output_tokens": 2048,
+        "router_max_steps": 4,
+        "agent_max_turns": 4,
+        "participant_deliberation": false
+      },
+      "context_rows": 983,
+      "new_prompt_in_all_contexts": true,
+      "current_base_prompt_in_all_contexts": true,
+      "errors": {},
+      "accepted_transfers": 480,
+      "unique_pair_periods": 480,
+      "actions": {
+        "get_observation": 980,
+        "submit_decision": 480,
+        "insurance_assignment": 20
+      },
+      "failed_actions": {},
+      "failed_action_details": [],
+      "model_call_failures": [],
+      "run_events": {
+        "run_started": 1,
+        "configuration_loaded": 1,
+        "insurance_assignment_configuration": 1,
+        "framework_ready": 1,
+        "scheduler_step_started": 49,
+        "model_call_finished": 1463,
+        "tool_actions": 49,
+        "agent_result": 980,
+        "scheduler_step_finished": 49,
+        "insurance_assigned": 1,
+        "payment_selected": 1,
+        "run_finished": 1
+      },
+      "scheduler_steps": 49,
+      "periods_with_multiple_scheduler_steps": {
+        "30": 2
+      },
+      "extra_participant_calls_over_expected": 23,
+      "phase_means": [
+        {
+          "periods": [
+            1,
+            15
+          ],
+          "mean": 90.5,
+          "n": 150
+        },
+        {
+          "periods": [
+            16,
+            30
+          ],
+          "mean": 84.61333333333333,
+          "n": 150
+        },
+        {
+          "periods": [
+            31,
+            45
+          ],
+          "mean": 91.04,
+          "n": 150
+        },
+        {
+          "periods": [
+            46,
+            48
+          ],
+          "mean": 92,
+          "n": 30
+        }
+      ],
+      "first_context_lines": {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 12,
+        "13": 13,
+        "14": 14,
+        "15": 15,
+        "16": 16,
+        "17": 17,
+        "18": 18,
+        "19": 19,
+        "20": 20
+      }
+    },
+    "baseline_alternative": {
+      "run_dir": "experiments/fixed_preferences_v1/runs/baseline/20261025T132347Z-4a63a987",
+      "config": {
+        "success": true,
+        "stop_reason": "natural_termination",
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "participant_model_requests": 1027,
+        "router_model_requests": 480,
+        "failure_details": [],
+        "agent_concurrency": 20,
+        "seed": 2026,
+        "prompt_sha256": "3c681ec0c6608513cb3259061500c03077c53bfd8b42139417585773375ffdfc",
+        "preferences_sha256": "75bdc98b88945880a16a5dbebdc282c17a399d7653867ba8494e42bf0417e3c3",
+        "max_output_tokens": 2048,
+        "router_max_steps": 4,
+        "agent_max_turns": 4,
+        "participant_deliberation": false
+      },
+      "context_rows": 1027,
+      "new_prompt_in_all_contexts": true,
+      "current_base_prompt_in_all_contexts": true,
+      "errors": {},
+      "accepted_transfers": 480,
+      "unique_pair_periods": 480,
+      "actions": {
+        "get_observation": 1020,
+        "submit_decision": 480,
+        "participant_decision_rejected": 2
+      },
+      "failed_actions": {
+        "participant_decision_rejected": 2
+      },
+      "failed_action_details": [
+        {
+          "line": 911,
+          "agent_id": 7,
+          "step": 31,
+          "action": "participant_decision_rejected",
+          "error": "No explicit decision fields were found in your request. Use the specified decision fields; if your task is waiting, use finish."
+        },
+        {
+          "line": 1002,
+          "agent_id": 17,
+          "step": 34,
+          "action": "participant_decision_rejected",
+          "error": "No explicit decision fields were found in your request. Use the specified decision fields; if your task is waiting, use finish."
+        }
+      ],
+      "model_call_failures": [],
+      "run_events": {
+        "run_started": 1,
+        "configuration_loaded": 1,
+        "framework_ready": 1,
+        "scheduler_step_started": 51,
+        "model_call_finished": 1507,
+        "tool_actions": 51,
+        "agent_result": 1020,
+        "scheduler_step_finished": 51,
+        "payment_selected": 1,
+        "run_finished": 1
+      },
+      "scheduler_steps": 51,
+      "periods_with_multiple_scheduler_steps": {
+        "19": 2,
+        "24": 2,
+        "47": 2
+      },
+      "extra_participant_calls_over_expected": 67,
+      "phase_means": [
+        {
+          "periods": [
+            1,
+            15
+          ],
+          "mean": 89,
+          "n": 150
+        },
+        {
+          "periods": [
+            16,
+            30
+          ],
+          "mean": 90.2,
+          "n": 150
+        },
+        {
+          "periods": [
+            31,
+            45
+          ],
+          "mean": 90.66666666666667,
+          "n": 150
+        },
+        {
+          "periods": [
+            46,
+            48
+          ],
+          "mean": 90.66666666666667,
+          "n": 30
+        }
+      ],
+      "first_context_lines": {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "11": 11,
+        "12": 12,
+        "13": 13,
+        "14": 14,
+        "15": 15,
+        "16": 16,
+        "17": 17,
+        "18": 18,
+        "19": 19,
+        "20": 20
+      }
+    }
+  },
+  "source_hash_differences_between_main_runs": {},
+  "notes": {
+    "25V_period16_two_steps": "Expected insurance decision stage then transfer stage; not a failed-period retry.",
+    "baseline_repeated_transfer_period": 43,
+    "25F_repeated_transfer_period": 30,
+    "receipt_period_token_mismatches": 0,
+    "alternate_baseline_post_minus_pre": 1.6666666666666714,
+    "main_baseline_post_minus_pre": 3.8333333333333286,
+    "25V_post_DID_main_baseline": -2.23333333333332,
+    "25V_post_DID_alternate_baseline": -0.06666666666666288,
+    "25F_post_DID_main_baseline": -3.2933333333333223,
+    "25F_post_DID_alternate_baseline": -1.1266666666666652
+  }
+}

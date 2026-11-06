@@ -119,10 +119,10 @@ def test_initialization_pairing_and_reproducibility():
         assert four.pair_members == original_pairs
 
 
-def test_only_baseline_is_implemented():
-    with pytest.raises(NotImplementedError, match="Baseline only"):
-        RiskSharingEnv([1, 2], treatment=spec.Treatment.VOLUNTARY_INSURANCE_25)
-    with pytest.raises(NotImplementedError, match="Baseline only"):
+def test_supported_treatments_and_unresolved_25f():
+    assert RiskSharingEnv([1, 2]).treatment is spec.Treatment.BASELINE
+    assert RiskSharingEnv([1, 2], treatment="25V").treatment is spec.Treatment.VOLUNTARY_INSURANCE_25
+    with pytest.raises(ValueError, match="probabilities.*unresolved"):
         RiskSharingEnv([1, 2], treatment=spec.Treatment.FORCED_INSURANCE_25)
 
 

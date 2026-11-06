@@ -1,0 +1,41 @@
+{
+  "mode": "offline_reformat_only",
+  "external_model_calls": 0,
+  "renderer_sha256": "a44b3b7c92519a9d6c9b4f672d1cf0d39e607cae91f5e2a393df221c587ac0dc",
+  "runs": [
+    {
+      "treatment": "baseline",
+      "run_id": "20261025T134921Z-99290f7f",
+      "source": "experiments/fixed_preferences_v1/runs/baseline/20261025T134921Z-99290f7f/participant_contexts.jsonl",
+      "inputs_checked": 984,
+      "all_fields_equal_after_decoding": true,
+      "period_45_mean_characters": {
+        "legacy": 22052.9,
+        "readable_v1": 22684.4
+      }
+    },
+    {
+      "treatment": "25v",
+      "run_id": "20261025T145836Z-65a997b1",
+      "source": "experiments/fixed_preferences_v1/runs/25v/20261025T145836Z-65a997b1/participant_contexts.jsonl",
+      "inputs_checked": 989,
+      "all_fields_equal_after_decoding": true,
+      "period_45_mean_characters": {
+        "legacy": 28019.380952380954,
+        "readable_v1": 27995.190476190477
+      }
+    },
+    {
+      "treatment": "25f",
+      "run_id": "20261026T032217Z-54514d0b",
+      "source": "experiments/fixed_preferences_v1/runs/25f/20261026T032217Z-54514d0b/participant_contexts.jsonl",
+      "inputs_checked": 983,
+      "all_fields_equal_after_decoding": true,
+      "period_45_mean_characters": {
+        "legacy": 27999.5,
+        "readable_v1": 28027.9
+      }
+    }
+  ],
+  "total_inputs_checked": 2956
+}

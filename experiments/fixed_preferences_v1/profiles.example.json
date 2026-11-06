@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "1": {
+      "risk_aversion": "low",
+      "advantageous_inequality_aversion": "low"
+    },
+    "2": {
+      "risk_aversion": "high",
+      "advantageous_inequality_aversion": "low"
+    },
+    "3": {
+      "risk_aversion": "low",
+      "advantageous_inequality_aversion": "high"
+    },
+    "4": {
+      "risk_aversion": "high",
+      "advantageous_inequality_aversion": "high"
+    }
+  }
+}

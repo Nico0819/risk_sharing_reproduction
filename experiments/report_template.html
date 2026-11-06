@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>风险分担实验 · 结果报告</title>
+  <style>
+    :root { color-scheme: light; --ink:#162d3a; --muted:#647583; --teal:#087f79; --line:#e4eaf0; --paper:#fff; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#f3f6f8; color:var(--ink); font:15px/1.65 system-ui,"Noto Sans CJK SC","Microsoft YaHei",sans-serif; }
+    main { max-width:1380px; margin:auto; padding:42px 32px 32px; }
+    .eyebrow { color:var(--teal); font-size:12px; font-weight:750; letter-spacing:2px; }
+    .hero { display:flex; justify-content:space-between; align-items:center; gap:20px; margin:12px 0 26px; }
+    h1 { font-size:34px; line-height:1.3; letter-spacing:-1px; margin:0 0 10px; }
+    h2 { font-size:20px; margin:0; }
+    p { margin:6px 0; }
+    .subtle { color:var(--muted); font-size:13px; }
+    a { color:var(--teal); text-underline-offset:3px; }
+    .hero-actions { display:flex; align-items:center; gap:16px; flex-shrink:0; }
+    .pill { display:inline-block; border-radius:6px; padding:3px 9px; font-size:12px; font-weight:600; background:#edf2f5; color:#5b6c7a; }
+    .bought,.success { color:#06736b; background:#e4f4ef; }
+    .pending { color:#93681c; background:#fff3d9; }
+    .stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin-bottom:24px; }
+    .stat,.panel { background:var(--paper); border:1px solid var(--line); border-radius:14px; }
+    .stat { padding:21px 24px; }
+    .stat-label { color:var(--muted); font-size:13px; }
+    .stat-value { font-size:32px; font-weight:700; line-height:1.45; font-variant-numeric:tabular-nums; }
+    .stat-note { color:var(--muted); font-size:12px; }
+    .panel { margin-bottom:24px; overflow:hidden; }
+    .panel-head { padding:24px 24px 18px; display:flex; align-items:center; justify-content:space-between; gap:18px; flex-wrap:wrap; }
+    .controls { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    input,select,button { font:inherit; color:var(--ink); background:#fff; border:1px solid #cfd9e2; border-radius:7px; padding:8px 11px; }
+    input { width:240px; }
+    select { max-width:100%; }
+    button { cursor:pointer; }
+    button:disabled { opacity:.4; cursor:default; }
+    button:hover:not(:disabled) { border-color:var(--teal); }
+    :focus-visible { outline:3px solid #71c8bf; outline-offset:2px; }
+    .table-wrap { overflow:auto; max-height:520px; }
+    table { width:100%; border-collapse:collapse; white-space:nowrap; text-align:left; font-size:13px; }
+    th { position:sticky; top:0; z-index:1; padding:12px 24px; background:#f8fafb; color:var(--muted); font-weight:600; border-block:1px solid var(--line); }
+    td { padding:15px 24px; border-bottom:1px solid #edf1f4; font-variant-numeric:tabular-nums; }
+    tbody tr { cursor:pointer; }
+    tbody tr:hover { background:#f4faf8; }
+    tbody tr.selected { background:#eaf6f3; }
+    .member { display:inline-flex; align-items:center; gap:7px; margin-right:18px; }
+    .pair-button { border:0; background:transparent; color:var(--teal); padding:0; font-weight:700; }
+    .number { text-align:right; }
+    .table-footer { padding:15px 24px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+    .pagination { display:flex; align-items:center; gap:12px; }
+    .chart-description { padding:0 24px 8px; }
+    .phase { display:inline-block; margin-right:15px; font-size:12px; color:var(--muted); }
+    .phase::before { content:""; display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:6px; background:#c5d1dc; }
+    .phase.active::before { background:#b9dfd2; }
+    .phase.after::before { background:#c8d6ed; }
+    .charts { display:grid; grid-template-columns:1fr 1fr; padding:0 12px; }
+    .chart { min-width:0; height:360px; }
+    .chart-note { padding:0 24px 22px; }
+    .comparison-controls { padding:0 24px 16px; }
+    .comparison-controls input[type="number"] { width:86px; }
+    .pair-picker { margin:0 24px 18px; padding:12px 16px; border:1px solid var(--line); border-radius:10px; }
+    .pair-picker summary { cursor:pointer; font-weight:600; }
+    .picker-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:12px 0; }
+    .pair-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(225px,1fr)); gap:8px; max-height:196px; overflow:auto; }
+    .pair-option { display:flex; align-items:flex-start; gap:9px; padding:8px; border-radius:6px; background:#f8fafb; cursor:pointer; font-size:13px; }
+    .pair-option input { width:auto; margin-top:5px; accent-color:var(--teal); }
+    .pair-option small { display:block; color:var(--muted); }
+    .comparison-stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; padding:0 24px 18px; }
+    .comparison-stat { background:#f6f9fa; border-radius:8px; padding:12px 16px; }
+    .comparison-stat strong { display:block; font-size:23px; font-variant-numeric:tabular-nums; }
+    .comparison-plots { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.35fr); gap:12px; padding:0 12px; }
+    .plot-scroll { max-height:580px; overflow:auto; min-width:0; border-bottom:1px solid var(--line); }
+    .comparison-plot { min-width:0; min-height:310px; }
+    .comparison-trend { height:390px; margin:8px 12px 0; }
+    .comparison-table { max-height:470px; }
+    .comparison-table td,.comparison-table th { padding:12px 16px; }
+    .sort-button { border:0; background:transparent; font-size:inherit; padding:0; color:inherit; font-weight:600; }
+    .comparison-table tbody tr { cursor:default; }
+    .comparison-notes { padding:14px 24px 22px; }
+    .comparison-error { color:#a34231; padding:0 24px 12px; }
+    .empty { color:var(--muted); padding:32px; text-align:center; }
+    .footer { display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
+    .footer a { margin-left:12px; }
+    @media(max-width:850px) { main { padding:26px 16px; } .charts { grid-template-columns:1fr; } .hero { align-items:flex-start; flex-direction:column; } h1 { font-size:28px; } .stats { grid-template-columns:repeat(2,1fr); } .stat { padding:16px; } .panel-head { padding:20px 16px; } td,th { padding:12px 16px; } }
+    @media(max-width:850px) { .comparison-plots { grid-template-columns:1fr; } .comparison-controls { padding:0 16px 16px; } .pair-picker { margin:0 16px 18px; } .comparison-stats { padding:0 16px 18px; gap:8px; } .comparison-stat { padding:10px; } .comparison-stat strong { font-size:19px; } .picker-toolbar input { width:100%; } }
+    @media print { body { background:white; } main { padding:0; } .controls,.hero-actions,.pagination { display:none; } .panel { break-inside:avoid; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">RISK SHARING · EXPERIMENT RESULTS</div>
+  <header class="hero">
+    <div><h1 id="title">风险分担实验</h1><p id="run-label" class="subtle"></p></div>
+    <div class="hero-actions"><span id="run-status" class="pill"></span><a href="summary.md">文字摘要与完整明细 ↗</a></div>
+  </header>
+  <section class="stats" id="stats" aria-label="本次运行概览"></section>
+  <section class="panel" id="assignment-note" hidden>
+    <div class="panel-head"><div><h2>电脑分配保险</h2><p id="assignment-description" class="subtle"></p><p id="assignment-config" class="subtle"></p></div></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head">
+      <div><h2>各组概览</h2><p class="subtle">按实际固定配对展示。点击组别，查看下方的逐轮轨迹。</p></div>
+      <div class="controls">
+        <input id="search" type="search" aria-label="搜索组别或参与者" placeholder="搜索 Pair、Agent 或购买情况">
+        <label class="subtle">每页 <select id="page-size" aria-label="每页组数"><option>10</option><option selected>25</option><option>50</option></select> 组</label>
+      </div>
+    </div>
+    <div class="table-wrap"><table><thead><tr id="table-head"></tr></thead><tbody id="table-body"></tbody></table></div>
+    <div class="table-footer"><span id="table-count" class="subtle" aria-live="polite"></span><div class="pagination"><button id="prev">上一页</button><span id="page-label" class="subtle"></span><button id="next">下一页</button></div></div>
+  </section>
+  <section class="panel" id="comparison" aria-label="组间对比">
+    <div class="panel-head">
+      <div><h2>组间对比</h2><p class="subtle">在相同轮次范围内比较各组。可多选组别，点击表头排序。</p></div>
+      <button id="download-comparison">下载当前对比 CSV</button>
+    </div>
+    <div class="controls comparison-controls">
+      <label>轮次范围 <select id="compare-period" aria-label="对比轮次范围"><option value="all">全部已记录轮次</option><option value="phase1">第 1—15 轮</option><option value="phase2">第 16—30 轮</option><option value="phase3">第 31—45 轮</option><option value="tail">第 46 轮及以后</option><option value="custom">自定义范围</option></select></label>
+      <label>从 <input id="compare-start" type="number" min="1" step="1" aria-label="对比起始轮次"></label>
+      <label>到 <input id="compare-end" type="number" min="1" step="1" aria-label="对比结束轮次"></label>
+      <label>图表指标 <select id="compare-metric" aria-label="组间对比指标"><option value="transfer_mean">平均每轮转账</option><option value="income_gap_mean">平均绝对收入差</option><option value="income_mean">平均每人最终收入</option><option value="transfer_positive_rate">有转账的轮次比例</option></select></label>
+    </div>
+    <p id="comparison-error" class="comparison-error" role="status" hidden></p>
+    <details class="pair-picker" open>
+      <summary id="selection-summary">选择参与对比的组</summary>
+      <div class="picker-toolbar"><input id="compare-search" type="search" aria-label="筛选待选组别" placeholder="搜索 Pair、Agent 或购买情况"><button id="compare-all">选中筛选结果</button><button id="compare-clear">清空选择</button></div>
+      <div id="pair-options" class="pair-options"></div>
+    </details>
+    <div id="comparison-stats" class="comparison-stats" aria-live="polite"></div>
+    <div class="comparison-plots"><div class="plot-scroll"><div id="ranking-chart" class="comparison-plot"></div></div><div class="plot-scroll"><div id="heatmap-chart" class="comparison-plot"></div></div></div>
+    <div id="comparison-trend" class="comparison-trend"></div>
+    <p id="comparison-chart-note" class="chart-note subtle"></p>
+    <div class="table-wrap comparison-table"><table><thead><tr id="comparison-head"></tr></thead><tbody id="comparison-body"></tbody></table></div>
+    <div class="comparison-notes subtle">
+      <p id="comparison-count"></p>
+      <p>平均转账按每组每轮转出金额计算；有转账指当轮转出大于 0。收入指标仅使用两位成员收入均完整的同轮记录，收入差取绝对值。缺失记录不补零，各指标使用各自的有效轮数。</p>
+      <p>跨组均值按各组等权计算。这些图表是描述性比较，不代表显著性检验或因果效应；第 46 轮及以后的记录与论文第 31—45 轮分析阶段分开显示。</p>
+    </div>
+  </section>
+  <section class="panel" id="detail">
+    <div class="panel-head">
+      <div><h2 id="detail-title">逐轮轨迹</h2><p id="detail-subtitle" class="subtle"></p></div>
+      <label class="controls subtle">查看组别 <select id="pair-select" aria-label="选择查看的组"></select></label>
+    </div>
+    <div class="chart-description" id="phases"></div>
+    <div class="charts"><div id="transfer-chart" class="chart"></div><div id="income-chart" class="chart"></div></div>
+    <p class="chart-note subtle">悬停查看数值，点击图例可隐藏或显示曲线；右上角相机按钮可下载图表。金额单位为实验点数。各组使用相同纵轴范围，缺失记录留空。</p>
+  </section>
+  <footer class="footer"><span id="footer-note"></span><span><a href="period_records.jsonl">逐轮数据</a><a id="choices-link" href="insurance_decisions.jsonl">保险决定</a><a href="manifest.json">运行参数</a></span></footer>
+</main>
+<script>__PLOTLY_JS__</script>
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>
+(() => {
+  "use strict";
+  const data = JSON.parse(document.getElementById("report-data").textContent);
+  const byId = id => document.getElementById(id);
+  const number = value => Number(value).toLocaleString("zh-CN");
+  const node = (tag, text, className) => { const element = document.createElement(tag); element.textContent = text; if(className) element.className=className; return element; };
+  const pairs = data.pairs;
+  const forced = data.insurance_mode === "forced";
+  const coverage = member => forced ? member.assigned : member.purchase;
+  const coveredCount = pair => forced ? pair.covered : pair.purchased;
+  const recordedCount = pair => forced ? pair.assigned : pair.submitted;
+  let selected = 0, page = 0;
+  byId("title").textContent = `${data.treatment} 实验结果`;
+  document.title = `${data.treatment} 实验结果 · ${data.run_id}`;
+  byId("run-label").textContent = `${data.backend === "llm" ? "LLM 参与者" : "Scripted 离线测试"} · ${data.run_id}`;
+  byId("run-status").textContent = data.success ? "运行成功" : "运行未完整结束";
+  byId("run-status").className = `pill ${data.success ? "success" : "pending"}`;
+  const bought = pairs.reduce((sum,pair) => sum+coveredCount(pair),0);
+  const submitted = pairs.reduce((sum,pair) => sum+recordedCount(pair),0);
+  const coverageTotal = forced && !data.reached_insurance ? "尚未分配"
+    : forced && submitted<data.agents ? `${bought} 人已确认` : `${bought} / ${data.agents}`;
+  const stats = [
+    ["已结算轮次",number(data.completed_periods),"只统计已有结算记录"],
+    ["固定配对",`${number(pairs.length)} 组`,"每组独立展示"],
+    ["参与者",`${number(data.agents)} 人`,"按真实配对关联"],
+    data.insurance ? [forced ? "原分配获保人数" : "购买保险",coverageTotal,forced ? `已确认 ${submitted} 份电脑分配记录` : `已接受 ${submitted} 份投保决定`]
+      : ["模型请求",number(data.model_requests),"包含参与者与 Router"],
+  ];
+  for(const [label,value,note] of stats) { const card=node("div","","stat"); card.append(node("div",label,"stat-label"),node("div",value,"stat-value"),node("div",note,"stat-note")); byId("stats").append(card); }
+  if(forced) {
+    byId("assignment-note").hidden=false;
+    byId("assignment-description").textContent=`展示第 ${data.insurance_start} 轮由电脑随机生成的原始分配，参与者只决定转账。第 ${data.removal} 轮撤销保险后仍保留原分配，保费和赔付按已结算记录汇总。缺失或异常分配不会视为未获保。`;
+    const configuration=data.insurance_assignment_configuration || {}, probabilities=configuration.probabilities || {};
+    const probability=value => typeof value==="number" && Number.isFinite(value) ? `${(value*100).toLocaleString("zh-CN",{maximumFractionDigits:2})}%` : "未记录";
+    byId("assignment-config").textContent=`本次分配概率：双方获保 ${probability(probabilities.both_insured)}，仅第一位成员获保 ${probability(probabilities.first_only)}，仅第二位成员获保 ${probability(probabilities.second_only)}。成员顺序沿用原始分配记录。本项目尚未核实论文的精确分配概率，这里展示本次运行配置。`;
+  }
+  for(const id of ["search","compare-search"]) byId(id).placeholder=forced ? "搜索 Pair、Agent 或分配情况" : data.insurance ? "搜索 Pair、Agent 或购买情况" : "搜索 Pair 或 Agent";
+  const headers = data.insurance ? ["组别",forced ? "成员及原始分配" : "成员及购买选择",forced ? "获保人数" : "购买人数",forced ? "分配情况" : "购买情况","保费合计","赔付合计"] : ["组别","成员","已结算轮次"];
+  headers.forEach(label => byId("table-head").append(node("th",label)));
+  const choiceLabel = member => forced
+    ? member.assignment_status === "invalid" ? "分配记录需核对" : member.assigned === true ? "获分配保险" : member.assigned === false ? "未获分配保险" : data.reached_insurance ? "缺少分配记录" : "尚未分配"
+    : member.purchase === true ? "购买" : member.purchase === false ? "不购买" : "未提交";
+  const coverageSummary = pair => forced && !data.reached_insurance ? "尚未分配"
+    : forced && recordedCount(pair)<pair.members.length ? `${coveredCount(pair)} 人已确认` : `${coveredCount(pair)}/${pair.members.length}`;
+  const pairMembers = pair => pair.members.map(member => `Agent ${member.id}`).join(" / ");
+  const plotLabel = value => String(value).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  function showTable() {
+    const term = byId("search").value.trim().toLowerCase();
+    const rows = pairs.map((pair,index) => ({pair,index})).filter(({pair}) => `${pair.label} ${pairMembers(pair)} ${pair.status} ${data.insurance ? pair.members.map(choiceLabel).join(" ") : ""}`.toLowerCase().includes(term));
+    const size = Number(byId("page-size").value), pages = Math.max(1,Math.ceil(rows.length/size));
+    page = Math.min(page,pages-1);
+    byId("table-body").replaceChildren();
+    for(const {pair,index} of rows.slice(page*size,(page+1)*size)) {
+      const tr=document.createElement("tr"); tr.className=index===selected ? "selected" : "";
+      const label=document.createElement("td"), button=node("button",pair.label,"pair-button"); button.addEventListener("click",() => selectPair(index)); label.append(button);
+      const members=document.createElement("td");
+      for(const member of pair.members) { const entry=node("span",`Agent ${member.id}`,"member"); if(data.insurance) entry.append(node("span",choiceLabel(member),`pill ${coverage(member) === true ? "bought" : coverage(member) == null ? "pending" : ""}`)); members.append(entry); }
+      tr.append(label,members);
+      if(data.insurance) tr.append(node("td",coverageSummary(pair)),node("td",pair.status),node("td",number(pair.premium),"number"),node("td",number(pair.payout),"number"));
+      else tr.append(node("td",number(pair.period_count)));
+      tr.addEventListener("click",event => { if(!event.target.closest("button")) selectPair(index); });
+      byId("table-body").append(tr);
+    }
+    if(!rows.length) { const tr=document.createElement("tr"), td=node("td","没有匹配的分组记录。","empty"); td.colSpan=headers.length; tr.append(td); byId("table-body").append(tr); }
+    byId("table-count").textContent=rows.length ? `显示 ${page*size+1}—${Math.min((page+1)*size,rows.length)} 组，共 ${rows.length} 组` : "共 0 组";
+    byId("page-label").textContent=`${page+1} / ${pages}`;
+    byId("prev").disabled=page===0; byId("next").disabled=page>=pages-1;
+  }
+  const last = data.periods.length ? data.periods[data.periods.length-1] : 0;
+  if(data.insurance) {
+    byId("phases").append(node("span",`1—${data.insurance_start-1} 轮 · 引入前`,"phase"));
+    if(last>=data.insurance_start) byId("phases").append(node("span",`${data.insurance_start}—${Math.min(last,data.insurance_end)} 轮 · 保险期`,"phase active"));
+    if(last>=data.removal) byId("phases").append(node("span",`${data.removal} 轮起 · 撤销后`,"phase after"));
+  } else byId("phases").append(node("span","Baseline · 全程无保险","phase"));
+  let maxTransfer=0, minIncome=Infinity, maxIncome=-Infinity;
+  for(const pair of pairs) {
+    for(const value of pair.transfer) if(value!==null) maxTransfer=Math.max(maxTransfer,value);
+    for(const member of pair.members) for(const value of member.income) if(value!==null) { minIncome=Math.min(minIncome,value); maxIncome=Math.max(maxIncome,value); }
+  }
+  const incomePadding=Number.isFinite(minIncome) ? Math.max(25,(maxIncome-minIncome)*.15) : 1;
+  function layout(title,range) {
+    const shapes=[], annotations=[];
+    if(data.insurance && last>=data.insurance_start) {
+      shapes.push({type:"rect",xref:"x",yref:"paper",x0:data.insurance_start-.5,x1:Math.min(last+.5,data.insurance_end+.5),y0:0,y1:1,fillcolor:"#eaf5ee",line:{width:0},layer:"below"});
+      for(const [x,text] of [[data.insurance_start,"保险引入"],[data.removal,"保险撤销"]]) if(x<=last) {
+        shapes.push({type:"line",xref:"x",yref:"paper",x0:x,x1:x,y0:0,y1:1,line:{color:"#9cafb7",width:1,dash:"dot"},layer:"below"});
+        annotations.push({x,y:1.03,xref:"x",yref:"paper",text,showarrow:false,font:{size:10,color:"#647583"},yanchor:"bottom"});
+      }
+    }
+    return {title:{text:title,font:{size:15,color:"#162d3a"},x:.04},height:360,margin:{l:62,r:20,t:72,b:58},paper_bgcolor:"white",plot_bgcolor:"white",font:{family:'system-ui,"Noto Sans CJK SC","Microsoft YaHei",sans-serif',size:12,color:"#647583"},hovermode:"x unified",legend:{orientation:"h",y:-.2,x:0},xaxis:{title:{text:"实验轮次"},range:[.5,Math.max(1,last)+.5],tickmode:"auto",nticks:8,tickformat:"d",showgrid:false,zeroline:false},yaxis:{title:{text:"实验点数"},range,gridcolor:"#edf1f4",zeroline:false},shapes,annotations};
+  }
+  const config={responsive:true,displaylogo:false,scrollZoom:false,toImageButtonOptions:{format:"png",filename:"risk-sharing-chart",scale:2},modeBarButtonsToRemove:["lasso2d","select2d"]};
+  const comparisonSelection = new Set(pairs.map((pair,index) => index));
+  const metrics = {
+    transfer_mean:{label:"平均每轮转账",series:"transfer",count:"transfer_valid_periods",unit:"实验点数"},
+    income_gap_mean:{label:"平均绝对收入差",series:"income_gap",count:"income_valid_periods",unit:"实验点数"},
+    income_mean:{label:"平均每人最终收入",series:"income_mean",count:"income_valid_periods",unit:"实验点数"},
+    transfer_positive_rate:{label:"有转账的轮次比例",series:"transfer_positive",count:"transfer_valid_periods",unit:"比例",percent:true},
+  };
+  const finite = value => typeof value === "number" && Number.isFinite(value);
+  const average = values => values.length ? values.reduce((sum,value) => sum+value,0)/values.length : null;
+  const formatMetric = (value,percent=false) => !finite(value) ? "—" : percent ? `${(value*100).toLocaleString("zh-CN",{maximumFractionDigits:1})}%` : value.toLocaleString("zh-CN",{maximumFractionDigits:2});
+  let comparisonSort = {key:"transfer_mean",direction:-1}, comparisonRows = [];
+  byId("compare-start").value=1;
+  byId("compare-end").value=Math.max(1,last);
+  function comparisonRange() {
+    const start=Number(byId("compare-start").value), end=Number(byId("compare-end").value);
+    return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start>=1 && end>=start ? {start,end} : null;
+  }
+  function matchingPairs() {
+    const term=byId("compare-search").value.trim().toLowerCase();
+    return pairs.map((pair,index) => ({pair,index})).filter(({pair}) => `${pair.label} ${pairMembers(pair)} ${pair.status} ${data.insurance ? pair.members.map(choiceLabel).join(" ") : ""}`.toLowerCase().includes(term));
+  }
+  function showPicker() {
+    byId("pair-options").replaceChildren();
+    const rows=matchingPairs();
+    for(const {pair,index} of rows) {
+      const label=node("label","","pair-option"), checkbox=document.createElement("input");
+      checkbox.type="checkbox"; checkbox.value=String(index); checkbox.checked=comparisonSelection.has(index);
+      checkbox.setAttribute("aria-label",`对比 ${pair.label}`);
+      checkbox.addEventListener("change",() => { checkbox.checked ? comparisonSelection.add(index) : comparisonSelection.delete(index); showComparison(); });
+      const description=node("span",pair.label); description.append(node("small",`${pairMembers(pair)}${data.insurance ? ` · ${pair.status}` : ""}`));
+      label.append(checkbox,description); byId("pair-options").append(label);
+    }
+    if(!rows.length) byId("pair-options").append(node("p","没有匹配的组别。","subtle"));
+    byId("compare-all").disabled=!rows.length;
+  }
+  // Match summarize_pair in report_data.py: each metric keeps its own denominator.
+  function summarize(pair,indices) {
+    const transfers=indices.map(index => pair.transfer[index]).filter(finite);
+    const incomeIndices=indices.filter(index => finite(pair.income_mean[index]) && finite(pair.income_gap[index]));
+    return {
+      transfer_mean:average(transfers), transfer_valid_periods:transfers.length,
+      transfer_total:transfers.length ? transfers.reduce((sum,value) => sum+value,0) : null,
+      transfer_positive_rate:transfers.length ? transfers.filter(value => value>0).length/transfers.length : null,
+      income_mean:average(incomeIndices.map(index => pair.income_mean[index])),
+      income_gap_mean:average(incomeIndices.map(index => pair.income_gap[index])),
+      income_valid_periods:incomeIndices.length,
+    };
+  }
+  const comparisonColumns=[
+    {key:"label",label:"组别"}, {key:"members",label:"成员"},
+    ...(data.insurance ? [{key:"status",label:forced ? "分配情况" : "购买情况"}] : []),
+    {key:"transfer_valid_periods",label:"转账有效轮数"},
+    {key:"transfer_mean",label:"平均转账"},
+    {key:"transfer_positive_rate",label:"有转账轮次比例",percent:true},
+    {key:"income_mean",label:"每人平均收入"},
+    {key:"income_gap_mean",label:"平均绝对收入差"},
+    {key:"income_valid_periods",label:"收入有效轮数"},
+  ];
+  const rowValue=(row,key) => key==="label" ? row.pair.label : key==="members" ? pairMembers(row.pair) : key==="status" ? row.pair.status : row.summary[key];
+  function sortComparison(rows) {
+    return rows.slice().sort((a,b) => {
+      const x=rowValue(a,comparisonSort.key), y=rowValue(b,comparisonSort.key);
+      if(x===null || y===null) return x===y ? a.index-b.index : x===null ? 1 : -1;
+      const order=typeof x==="string" ? x.localeCompare(y,"zh-CN",{numeric:true}) : x-y;
+      return order*comparisonSort.direction || a.index-b.index;
+    });
+  }
+  function showComparisonTable() {
+    byId("comparison-head").replaceChildren(); byId("comparison-body").replaceChildren();
+    for(const column of comparisonColumns) {
+      const active=comparisonSort.key===column.key;
+      const th=node("th",""), button=node("button",`${column.label}${active ? comparisonSort.direction===1 ? " ↑" : " ↓" : ""}`,"sort-button");
+      th.scope="col"; th.setAttribute("aria-sort",active ? comparisonSort.direction===1 ? "ascending" : "descending" : "none");
+      button.addEventListener("click",() => {
+        const textColumn=["label","members","status"].includes(column.key);
+        comparisonSort={key:column.key,direction:active ? -comparisonSort.direction : textColumn ? 1 : -1};
+        comparisonRows=sortComparison(comparisonRows); showComparisonTable();
+      });
+      th.append(button); byId("comparison-head").append(th);
+    }
+    for(const row of comparisonRows) {
+      const tr=node("tr",""); tr.dataset.pairIndex=String(row.index);
+      for(const column of comparisonColumns) {
+        const td=node("td","");
+        if(column.key==="label") {
+          const button=node("button",row.pair.label,"pair-button");
+          button.addEventListener("click",() => { selectPair(row.index); byId("detail").scrollIntoView({behavior:"smooth",block:"start"}); }); td.append(button);
+        } else {
+          const value=rowValue(row,column.key);
+          td.textContent=typeof value==="string" ? value : formatMetric(value,column.percent);
+          if(typeof value!=="string") td.className="number";
+        }
+        tr.append(td);
+      }
+      byId("comparison-body").append(tr);
+    }
+    if(!comparisonRows.length) { const tr=node("tr",""), td=node("td","暂无可比较的组。请勾选组别并检查轮次范围。","empty"); td.colSpan=comparisonColumns.length; tr.append(td); byId("comparison-body").append(tr); }
+  }
+  function comparisonLayout(title,height=340) {
+    return {title:{text:title,font:{size:15,color:"#162d3a"},x:.04},height,margin:{l:85,r:35,t:55,b:60},paper_bgcolor:"white",plot_bgcolor:"white",font:{family:'system-ui,"Noto Sans CJK SC","Microsoft YaHei",sans-serif',size:12,color:"#647583"}};
+  }
+  function emptyComparisonCharts(message) {
+    for(const id of ["ranking-chart","heatmap-chart","comparison-trend"]) {
+      const emptyLayout=comparisonLayout("",id==="comparison-trend" ? 390 : 310);
+      emptyLayout.xaxis={visible:false}; emptyLayout.yaxis={visible:false};
+      emptyLayout.annotations=[{text:message,x:.5,y:.5,xref:"paper",yref:"paper",showarrow:false}];
+      Plotly.react(id,[],emptyLayout,config);
+    }
+  }
+  function showComparisonCharts(rows,indices,range,metricKey) {
+    const metric=metrics[metricKey], percent=metric.percent, hoverFormat=percent ? ".1%" : ".2f";
+    const ranked=rows.filter(row => finite(row.summary[metricKey])).sort((a,b) => b.summary[metricKey]-a.summary[metricKey] || a.index-b.index);
+    const rankLayout=comparisonLayout(`${metric.label} · 组间比较`,Math.max(310,ranked.length*30+110));
+    rankLayout.xaxis={title:{text:metric.unit},gridcolor:"#edf1f4",rangemode:"tozero",...(percent ? {range:[0,1.05],tickformat:".0%"} : {})};
+    rankLayout.yaxis={type:"category",autorange:"reversed",automargin:true};
+    if(!ranked.length) rankLayout.annotations=[{text:"该范围内没有有效记录",xref:"paper",yref:"paper",x:.5,y:.5,showarrow:false}];
+    Plotly.react("ranking-chart",ranked.length ? [{type:"bar",orientation:"h",x:ranked.map(row => row.summary[metricKey]),y:ranked.map(row => plotLabel(row.pair.label)),customdata:ranked.map(row => row.summary[metric.count]),marker:{color:"#087f79"},hovertemplate:`%{y}<br>${metric.label}：%{x:${hoverFormat}}<br>有效轮数：%{customdata}<extra></extra>`}] : [],rankLayout,config);
+    const periods=indices.map(index => data.periods[index]);
+    const heatRows=rows.slice().sort((a,b) => a.index-b.index);
+    const heatLayout=comparisonLayout("各组逐轮数值 · 热图",Math.max(310,heatRows.length*28+120));
+    heatLayout.margin.r=85;
+    heatLayout.xaxis={title:{text:"实验轮次"},range:[range.start-.5,range.end+.5],tickformat:"d",nticks:8};
+    heatLayout.yaxis={type:"category",autorange:"reversed",automargin:true};
+    const z=heatRows.map(row => indices.map(index => row.pair[metric.series][index]));
+    let zmax=0; for(const values of z) for(const value of values) if(finite(value)) zmax=Math.max(zmax,value);
+    Plotly.react("heatmap-chart",[{type:"heatmap",x:periods,y:heatRows.map(row => plotLabel(row.pair.label)),z,colorscale:[[0,"#f0f6f4"],[.45,"#79bbb0"],[1,"#075d60"]],zmin:0,zmax:percent ? 1 : zmax || 1,hoverongaps:false,colorbar:{thickness:12,len:.9,tickformat:percent ? ".0%" : undefined},hovertemplate:`%{y}<br>第 %{x} 轮：%{z:${hoverFormat}}<extra></extra>`}],heatLayout,config);
+    const trendLayout=layout(rows.length>6 ? "每轮组间均值与实际范围" : "选中组的逐轮对比");
+    trendLayout.height=390; trendLayout.xaxis.range=[range.start-.5,range.end+.5];
+    trendLayout.yaxis={title:{text:metric.unit},gridcolor:"#edf1f4",rangemode:"tozero",...(percent ? {range:[0,1.05],tickformat:".0%"} : {})};
+    trendLayout.annotations=trendLayout.annotations.filter(item => item.x>=range.start && item.x<=range.end);
+    const colors=["#087f79","#5267bb","#ca8232","#ad5580","#6d8c42","#8066a8"];
+    let traces=[];
+    if(rows.length<=6) {
+      traces=heatRows.map((row,i) => ({type:"scatter",mode:"lines+markers",x:periods,y:indices.map(index => row.pair[metric.series][index]),name:plotLabel(row.pair.label),line:{color:colors[i],width:2,dash:i%2 ? "dash" : "solid"},marker:{size:4},connectgaps:false,hovertemplate:`${plotLabel(row.pair.label)}<br>第 %{x} 轮：%{y:${hoverFormat}}<extra></extra>`}));
+      byId("comparison-chart-note").textContent="选中不超过 6 组时显示各组曲线。热图与曲线展示所选指标的逐轮值；比例指标在逐轮图中为 0%（无转账）或 100%（有转账）。缺失记录留空。";
+    } else {
+      const samples=indices.map(index => rows.map(row => row.pair[metric.series][index]).filter(finite));
+      const extrema=direction => samples.map(values => values.length ? values.reduce((result,value) => direction===1 ? Math.max(result,value) : Math.min(result,value)) : null);
+      traces=[
+        {type:"scatter",mode:"lines",x:periods,y:extrema(-1),line:{width:0},hoverinfo:"skip",showlegend:false,connectgaps:false},
+        {type:"scatter",mode:"lines",x:periods,y:extrema(1),line:{width:0},fill:"tonexty",fillcolor:"rgba(8,127,121,.13)",name:"各组实际最小—最大值",hoverinfo:"skip",connectgaps:false},
+        {type:"scatter",mode:"lines+markers",x:periods,y:samples.map(average),customdata:samples.map(values => values.length),line:{color:"#087f79",width:2.5},marker:{size:4},name:"当轮各有效组均值",connectgaps:false,hovertemplate:`第 %{x} 轮<br>组间均值：%{y:${hoverFormat}}<br>有效组数：%{customdata}<extra></extra>`},
+      ];
+      byId("comparison-chart-note").textContent=`已选 ${rows.length} 组：每组逐轮数值见热图，曲线显示每轮各有效组等权均值，阴影为实际最小—最大值，不是置信区间。勾选不超过 6 组可查看各组曲线。缺失记录不参与当轮统计。`;
+    }
+    Plotly.react("comparison-trend",traces,trendLayout,config);
+  }
+  function showComparison() {
+    const range=comparisonRange(), key=byId("compare-metric").value, metric=metrics[key];
+    const indices=data.periods.map((period,index) => ({period,index})).filter(({period}) => range && period>=range.start && period<=range.end).map(({index}) => index);
+    comparisonRows=range ? sortComparison(pairs.map((pair,index) => ({pair,index})).filter(({index}) => comparisonSelection.has(index)).map(row => ({...row,summary:summarize(row.pair,indices)}))) : [];
+    const validRows=comparisonRows.filter(row => finite(row.summary[key]));
+    byId("selection-summary").textContent=`选择参与对比的组 · 已选 ${comparisonSelection.size} / ${pairs.length} 组`;
+    byId("comparison-error").hidden=Boolean(range);
+    byId("comparison-error").textContent=range ? "" : "请输入正整数轮次，且起始轮次不能大于结束轮次。";
+    byId("download-comparison").disabled=!range || !comparisonRows.length;
+    const cards=[
+      ["参与比较",`${comparisonSelection.size} 组`,`${validRows.length} 组有当前指标的有效记录`],
+      [`组均值 · ${metric.label}`,formatMetric(average(validRows.map(row => row.summary[key])),metric.percent),"每组等权，排除无有效记录的组"],
+      ["有效组 × 轮次",number(validRows.reduce((sum,row) => sum+row.summary[metric.count],0)),range ? `第 ${range.start}—${range.end} 轮` : "轮次范围无效"],
+    ];
+    byId("comparison-stats").replaceChildren();
+    for(const [label,value,note] of cards) { const card=node("div","","comparison-stat"); card.append(node("div",label,"subtle"),node("strong",value),node("div",note,"subtle")); byId("comparison-stats").append(card); }
+    showComparisonTable();
+    byId("comparison-count").textContent=range ? `第 ${range.start}—${range.end} 轮 · 已选 ${comparisonRows.length} 组 · 当前指标有有效记录 ${validRows.length} 组。表中“—”表示没有有效记录。` : "请调整轮次范围后查看对比。";
+    if(!range || !comparisonRows.length || !indices.length || !validRows.length) {
+      emptyComparisonCharts(!range ? "请调整轮次范围" : !comparisonRows.length ? "请选择参与对比的组" : "该范围内没有有效记录");
+      byId("comparison-chart-note").textContent="缺失记录不会作为零值绘图或计入均值。";
+    } else showComparisonCharts(comparisonRows,indices,range,key);
+  }
+  function downloadComparison() {
+    const range=comparisonRange(); if(!range || !comparisonRows.length) return;
+    const columns=[{key:"start",label:"起始轮次"},{key:"end",label:"结束轮次"},...comparisonColumns];
+    const csvCell=value => {
+      if(value===null || value===undefined) return '""';
+      let text=String(value);
+      // Spreadsheet formula prefixes in identifiers must remain literal text.
+      if(typeof value==="string" && /^[=+@\-\t\r\n]/.test(text)) text="'"+text;
+      return '"'+text.replaceAll('"','""')+'"';
+    };
+    const lines=[columns.map(column => csvCell(column.percent ? `${column.label}（%）` : column.label)).join(",")];
+    for(const row of comparisonRows) lines.push(columns.map(column => {
+      const value=column.key==="start" ? range.start : column.key==="end" ? range.end : rowValue(row,column.key);
+      return csvCell(column.percent && finite(value) ? value*100 : value);
+    }).join(","));
+    const url=URL.createObjectURL(new Blob(["\uFEFF"+lines.join("\r\n")],{type:"text/csv;charset=utf-8"}));
+    const link=document.createElement("a"); link.href=url; link.download=`pair-comparison-${range.start}-${range.end}.csv`; document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url),1000);
+  }
+  byId("compare-period").addEventListener("change",event => {
+    const ranges={all:[1,Math.max(1,last)],phase1:[1,15],phase2:[16,30],phase3:[31,45],tail:[46,Math.max(46,last)]};
+    const range=ranges[event.target.value]; if(range) { byId("compare-start").value=range[0]; byId("compare-end").value=range[1]; } showComparison();
+  });
+  for(const id of ["compare-start","compare-end"]) byId(id).addEventListener("change",() => { byId("compare-period").value="custom"; showComparison(); });
+  byId("compare-metric").addEventListener("change",event => { comparisonSort={key:event.target.value,direction:-1}; showComparison(); });
+  byId("compare-search").addEventListener("input",showPicker);
+  byId("compare-all").addEventListener("click",() => { matchingPairs().forEach(({index}) => comparisonSelection.add(index)); showPicker(); showComparison(); });
+  byId("compare-clear").addEventListener("click",() => { comparisonSelection.clear(); showPicker(); showComparison(); });
+  byId("download-comparison").addEventListener("click",downloadComparison);
+  function showCharts() {
+    const pair=pairs[selected];
+    if(!pair) { byId("detail-subtitle").textContent="尚无可展示的分组记录。"; byId("pair-select").disabled=true; return; }
+    byId("detail-title").textContent=`${pair.label} · 逐轮轨迹`;
+    byId("detail-subtitle").textContent=`${pairMembers(pair)} · 已结算 ${pair.period_count} 轮${data.insurance ? ` · ${pair.status}` : ""}`;
+    byId("pair-select").value=String(selected);
+    const transfer=[{x:data.periods,y:pair.transfer,type:"scatter",mode:"lines+markers",name:"转出金额",line:{color:"#087f79",width:2.5},marker:{size:4},connectgaps:false,hovertemplate:"第 %{x} 轮 · 转出 %{y} 点<extra></extra>"}];
+    Plotly.react("transfer-chart",transfer,layout("每轮转账",[0,Math.max(25,Math.ceil(maxTransfer*1.15/25)*25)]),config);
+    const colors=["#5267bb","#d18b33","#087f79","#b66583"];
+    const incomes=pair.members.map((member,index) => ({x:data.periods,y:member.income,type:"scatter",mode:"lines+markers",name:`Agent ${plotLabel(member.id)}`,line:{color:colors[index%colors.length],width:index===0 ? 3 : 2,dash:index%2 ? "dash" : "solid"},marker:{size:index%2 ? 6 : 4,symbol:index%2 ? "circle-open" : "circle"},connectgaps:false,hovertemplate:`Agent ${plotLabel(member.id)}<br>第 %{x} 轮 · 收入 %{y} 点<extra></extra>`}));
+    const range=Number.isFinite(minIncome) ? [Math.max(0,minIncome-incomePadding),maxIncome+incomePadding] : [0,1];
+    Plotly.react("income-chart",incomes,layout("每人转账后收入",range),config);
+  }
+  function selectPair(index) { selected=index; showTable(); showCharts(); }
+  pairs.forEach((pair,index) => { const option=node("option",`${pair.label} · ${pairMembers(pair)}`); option.value=String(index); byId("pair-select").append(option); });
+  byId("pair-select").addEventListener("change",event => selectPair(Number(event.target.value)));
+  byId("search").addEventListener("input",() => { page=0; showTable(); });
+  byId("page-size").addEventListener("change",() => { page=0; showTable(); });
+  byId("prev").addEventListener("click",() => { page--; showTable(); });
+  byId("next").addEventListener("click",() => { page++; showTable(); });
+  byId("choices-link").hidden=!data.insurance;
+  if(forced) { byId("choices-link").href="insurance_assignments.jsonl"; byId("choices-link").textContent="保险分配记录"; }
+  byId("footer-note").textContent=`本页展示本次实际运行轨迹。${data.payment_period !== null && data.payment_period !== undefined ? `支付记录抽中第 ${data.payment_period} 轮，不是各轮收入之和。` : ""}`;
+  showTable(); showCharts(); showPicker(); showComparison();
+})();
+</script>
+</body>
+</html>

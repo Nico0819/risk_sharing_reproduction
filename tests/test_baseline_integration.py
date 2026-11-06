@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+from importlib import import_module
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,8 @@ def test_scripted_runner_uses_real_agent_router_adapter_and_is_bounded(tmp_path,
     assert manifest["run_dir"] == str(tmp_path / "run")
 
     run_dir = tmp_path / "run"
+    assert (run_dir / "report.html").is_file()
+    assert "[打开交互图表报告](report.html)" in (run_dir / "summary.md").read_text()
     actions = [json.loads(line) for line in (run_dir / "agent_actions.jsonl").read_text(encoding="utf-8").splitlines()]
     records = [json.loads(line) for line in (run_dir / "period_records.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["agent_id"] for row in actions} == {1, 2, 3, 4}
@@ -167,6 +170,189 @@ def test_scripted_runner_uses_real_agent_router_adapter_and_is_bounded(tmp_path,
     assert "LLM_API_KEY" not in log_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    "module,period_count,concurrency",
+    [
+        ("baseline", 3, 20),
+        ("baseline", 1, 3),
+        ("25v", 31, 20),
+        ("25f", 16, 20),
+    ],
+)
+def test_twenty_participants_use_real_framework_with_bounded_parallelism(
+    tmp_path, monkeypatch, module, period_count, concurrency,
+):
+    """Observe the real runner and settlement; substitute only model responses."""
+
+    _clear_runtime(monkeypatch)
+    from agentsociety2.agent import runner as framework_runner
+
+    participants = set(range(1, 21))
+    active, finished = set(), set()
+    peak_active = 0
+    first_call_agents = set()
+    first_calls_ready = asyncio.Event()
+    model_clients = {}
+    seen_observations = []
+    settlement_boundaries = []
+    fixed_pairs = {}
+    real_batch = framework_runner._step_agent_batch_async
+    real_step = RiskSharingEnv.step
+
+    async def observed_batch(agent_ids, *args, **kwargs):
+        nonlocal peak_active
+        assert len(agent_ids) == 1
+        agent_id = agent_ids[0]
+        assert agent_id not in active and agent_id not in finished
+        active.add(agent_id)
+        peak_active = max(peak_active, len(active))
+        try:
+            return await real_batch(agent_ids, *args, **kwargs)
+        finally:
+            active.remove(agent_id)
+            finished.add(agent_id)
+
+    async def observed_step(env, tick, t):
+        # Every real PersonAgent finishes before the environment can settle.
+        assert not active and finished == participants
+        if not fixed_pairs:
+            fixed_pairs.update(env.pair_members)
+        assert env.pair_members == fixed_pairs
+        settlement_boundaries.append((env.current_period, env.stage.value))
+        finished.clear()
+        return await real_step(env, tick, t)
+
+    class ConcurrentClient(ScriptedLLMClient):
+        async def call(self, model=None, messages=None, **kwargs):
+            if self.kind == "participant":
+                agent_id, observation = self._participant_turn(messages or [])
+                assert observation["agent_id"] == agent_id
+                model_clients.setdefault(id(self), set()).add(agent_id)
+                seen_observations.append(observation)
+                if observation["current_period"] == 1:
+                    first_call_agents.add(agent_id)
+                    if len(first_call_agents) == concurrency:
+                        first_calls_ready.set()
+                    # A rendezvous proves that configured parallelism really
+                    # occurs, including all 20 participants at concurrency=20.
+                    await asyncio.wait_for(first_calls_ready.wait(), timeout=10)
+                await asyncio.sleep(0)
+            return await super().call(model=model, messages=messages, **kwargs)
+
+    monkeypatch.setattr(framework_runner, "_step_agent_batch_async", observed_batch)
+    monkeypatch.setattr(RiskSharingEnv, "step", observed_step)
+    monkeypatch.setattr(run_smoke, "ScriptedLLMClient", ConcurrentClient)
+    root = tmp_path / module
+    options = {}
+    if module == "25f":
+        # Regression fixture only: these are NOT the paper's probabilities.
+        options = {"forced_assignment_probabilities": (0.5, 0.25, 0.25), "assignment_seed": 42}
+    manifest = import_module(f"experiments.{module}.run_smoke").run_experiment(
+        backend="scripted", env_path=tmp_path / "missing.env", participants=20,
+        agent_concurrency=concurrency, completed_period_limit=period_count,
+        seed=2026, run_dir=root, request_limit=2000, timeout_seconds=180,
+        **options,
+    )
+
+    def read_jsonl(name):
+        return [json.loads(line) for line in (root / name).read_text().splitlines()]
+
+    assert manifest["success"] is True
+    assert manifest["agents"] == 20 and manifest["pairs"] == 10
+    assert manifest["agent_concurrency"] == concurrency
+    assert manifest["router"] == "ReActRouter"
+    assert manifest["agent_class"] == "RiskSharingParticipant"
+    assert manifest["router_api_enabled"] is False
+    assert manifest["completed_periods"] == list(range(1, period_count + 1))
+    assert peak_active == concurrency
+    assert first_call_agents == participants
+    assert len(model_clients) == 20
+    assert {next(iter(ids)) for ids in model_clients.values()} == participants
+    assert all(len(ids) == 1 for ids in model_clients.values())
+    assert len(fixed_pairs) == 10
+    assert {member for pair in fixed_pairs.values() for member in pair} == participants
+    insurance_turns = int(module == "25v")
+    assert len(settlement_boundaries) == period_count + insurance_turns
+    assert manifest["participant_model_requests"] == 20 * (period_count + insurance_turns)
+    assert manifest["router_model_requests"] == 10 * period_count + 20 * insurance_turns
+    assert len(list((root / "agents").glob("agent_*"))) == 20
+
+    records = read_jsonl("period_records.jsonl")
+    assert len(records) == 20 * period_count
+    for period in range(1, period_count + 1):
+        period_rows = [row for row in records if row["period"] == period]
+        assert {row["agent_id"] for row in period_rows} == participants
+        for pair_id, members in fixed_pairs.items():
+            rows = [row for row in period_rows if row["pair_id"] == pair_id]
+            assert {row["agent_id"] for row in rows} == set(members)
+            assert sorted(row["random_income"] for row in rows) == [0, 200]
+            assert all(row["partner_id"] in members for row in rows)
+    for observation in seen_observations:
+        own_pair = {observation["agent_id"], observation["partner_id"]}
+        assert own_pair in [set(members) for members in fixed_pairs.values()]
+        assert not _contains_key(observation, {"treatment", "analysis_phase", "session_id"})
+        assert all(
+            row["agent_id"] in own_pair and row["partner_id"] in own_pair
+            and row["period"] < observation["current_period"]
+            for row in observation["history"]
+        )
+        assert len(observation["history"]) == 2 * (observation["current_period"] - 1)
+
+    actions = read_jsonl("agent_actions.jsonl")
+    accepted = [row for row in actions if row["action"] == "submit_decision"]
+    assert len(accepted) == 10 * period_count
+    assert all(row["ok"] for row in accepted)
+    assert len({row["decision_id"] for row in accepted}) == len(accepted)
+    for row in accepted:
+        observation = row["participant_model_message"]["observation"]
+        assert observation["agent_id"] == row["agent_id"]
+        assert observation["decision_id"] == row["decision_id"]
+        assert observation["random_income"] == 200
+        assert row["decision_source"] == "participant_model"
+        assert row["submitted_amount"] == row["participant_model_output"]["amount"] == row["environment_receipt"]["amount"]
+
+    if module == "25v":
+        choices = read_jsonl("insurance_decisions.jsonl")
+        assert len(choices) == manifest["insurance_decision_count"] == 20
+        assert {row["agent_id"]: row["purchase"] for row in choices} == {
+            agent_id: agent_id % 2 == 0 for agent_id in participants
+        }
+        assert (16, "insurance_decision") in settlement_boundaries
+        withdrawal = [obs for obs in seen_observations if obs["current_period"] == 31]
+        assert len(withdrawal) == 20
+        assert all(not obs["insured"] and "announcement" in obs for obs in withdrawal)
+        for row in records:
+            insured = row["agent_id"] % 2 == 0 and 16 <= row["period"] <= 30
+            assert row["insured"] is insured
+            assert row["insurance_cost"] == (25 if insured else 0)
+    elif module == "25f":
+        assignments = read_jsonl("insurance_assignments.jsonl")
+        assert len(assignments) == manifest["insurance_assignment_count"] == 20
+        assert manifest["insurance_decision_count"] == 0
+        assert manifest["insurance_assignment_configuration"]["paper_probability_resolved"] is False
+        assert all(row["assignment_source"] == "environment_random" for row in assignments)
+        assert not any(row["action"] == "submit_insurance_decision" for row in actions)
+        for pair_id in fixed_pairs:
+            assert any(row["insured"] for row in assignments if row["pair_id"] == pair_id)
+
+
+@pytest.mark.parametrize(
+    "participants,concurrency,error",
+    [(0, 1, "participants"), (1, 1, "participants"), (3, 1, "participants"),
+     (20, 0, "agent_concurrency"), (20, 21, "agent_concurrency")],
+)
+def test_runner_rejects_invalid_pair_count_or_concurrency(
+    tmp_path, monkeypatch, participants, concurrency, error,
+):
+    _clear_runtime(monkeypatch)
+    with pytest.raises(ValueError, match=error):
+        run_experiment(
+            backend="scripted", env_path=tmp_path / "missing.env",
+            participants=participants, agent_concurrency=concurrency,
+            run_dir=tmp_path / "invalid",
+        )
+
+
 def test_full_session_reaches_natural_termination_and_writes_payment_period(tmp_path, monkeypatch):
     _clear_runtime(monkeypatch)
     manifest = run_experiment(
@@ -215,6 +401,28 @@ def test_scripted_participant_cannot_submit_without_observation():
     arguments = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
     assert arguments["readonly"] is False
     assert "RISK_SHARING_PARTICIPANT_DECISION:" not in arguments["instruction"]
+
+
+def test_visual_report_failure_does_not_change_completed_experiment(tmp_path, monkeypatch):
+    from experiments import report
+
+    _clear_runtime(monkeypatch)
+
+    def unavailable_chart(*args, **kwargs):
+        raise RuntimeError("Chart renderer unavailable")
+
+    monkeypatch.setattr(report, "write_visual_report", unavailable_chart)
+    root = tmp_path / "visual-error"
+    manifest = run_experiment(backend="scripted", completed_period_limit=1, run_dir=root)
+    assert manifest["success"] is True
+    assert manifest["completed_periods"] == [1]
+    assert len((root / "period_records.jsonl").read_text().splitlines()) == 4
+    summary = (root / "summary.md").read_text()
+    assert "交互报告未生成" in summary
+    assert "[打开交互图表报告]" not in summary
+    logs = [json.loads(line) for line in (root / "run.log").read_text().splitlines()]
+    assert any(row["event"] == "visual_report_failed" for row in logs)
+    assert logs[-1]["event"] == "run_finished" and logs[-1]["success"] is True
 
 
 @pytest.mark.parametrize("failure", ["invalid_json", "missing_amount", "ambiguous_amount", "out_of_range"])
@@ -444,7 +652,10 @@ def test_participant_cannot_submit_after_observation_delivery_fails(tmp_path, mo
     assert manifest["success"] is False
     assert manifest["completed_periods"] == []
     assert manifest["router_model_requests"] == 0
+    assert manifest["participant_model_requests"] == 0
+    assert manifest["actual_model_requests"] == 0
     actions = [json.loads(line) for line in (run_dir / "agent_actions.jsonl").read_text().splitlines()]
-    assert actions
-    assert all(row["action"] == "participant_decision_rejected" for row in actions)
-    assert all("observation is required" in row["error"] for row in actions)
+    # Without the observation, constructing the participant's input fails before
+    # a provider can generate a guessed economic choice or call the Router.
+    assert actions == []
+    assert not (run_dir / "period_records.jsonl").read_text().strip()

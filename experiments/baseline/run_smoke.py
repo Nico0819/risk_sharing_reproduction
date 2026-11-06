@@ -1,4 +1,4 @@
-"""Run the Baseline participant smoke or full-session experiment.
+"""Run a participant smoke or full session (Baseline by default).
 
 The scripted backend exercises the real PersonAgent -> participant model ->
 environment adapter -> ReActRouter -> RiskSharingEnv path without network access. The llm
@@ -11,6 +11,7 @@ import argparse
 import copy
 import asyncio
 import hashlib
+from importlib import import_module
 import json
 import re
 import random
@@ -33,10 +34,25 @@ from custom.config import (  # noqa: E402
     RuntimeConfigError,
     load_runtime_config,
 )
+from custom.insurance_assignment import validate_assignment_configuration  # noqa: E402
+from custom.agents.observation_presentation import PRESENTATION_VERSION  # noqa: E402
 from protocol import paper_spec as protocol_spec  # noqa: E402
 
 
 DEFAULT_EXPERIMENT_TIMEOUT_SECONDS = 6 * 60 * 60
+
+
+def _validate_population(participants: int, agent_concurrency: int) -> None:
+    """Keep fixed pairs complete and bound concurrent participant turns."""
+
+    if (
+        type(participants) is not int
+        or participants < protocol_spec.PAIR_SIZE
+        or participants % protocol_spec.PAIR_SIZE != 0
+    ):
+        raise ValueError("participants must be an even integer of at least 2")
+    if type(agent_concurrency) is not int or not 1 <= agent_concurrency <= participants:
+        raise ValueError("agent_concurrency must be between 1 and participants")
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -125,7 +141,7 @@ def _router_request(messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
         request = json.loads(raw)
         if (
             isinstance(request, dict)
-            and request.get("tool") in {"get_observation", "submit_decision"}
+            and request.get("tool") in {"get_observation", "submit_decision", "submit_insurance_decision"}
             and isinstance(request.get("arguments"), dict)
         ):
             return request
@@ -148,7 +164,9 @@ class BudgetedClient:
         enforce_participant_progression: bool = False,
         enforce_router_progression: bool = False,
         call_logger: RunLogger | None = None,
+        deliberation_logger: RunLogger | None = None,
         agent_id: int | None = None,
+        pair_id: int | None = None,
     ):
         self.inner = inner
         self.budget = budget
@@ -158,7 +176,10 @@ class BudgetedClient:
         self.enforce_router_progression = enforce_router_progression
         self.actual_calls = 0
         self.call_logger = call_logger
+        self.deliberation_logger = deliberation_logger
+        self.deliberation_calls = 0
         self.agent_id = agent_id
+        self.pair_id = pair_id
         self._participant_tool_schemas: list[dict[str, Any]] = []
         self._router_tool_schemas: list[dict[str, Any]] = []
 
@@ -212,12 +233,16 @@ class BudgetedClient:
                 previous_args = json.loads(previous_args)
             except (TypeError, json.JSONDecodeError):
                 previous_args = {}
-            if (
-                previous_function.get("name") == "ask_env"
-                and (
-                    bool(previous_args.get("readonly"))
-                    or str(latest_tool.get("content", "")).startswith("ERROR:")
+            if str(latest_tool.get("content", "")).startswith("ERROR:"):
+                # A rejected unadvertised tool is not a completed action.
+                # Keep the legitimate choices available so the participant
+                # can correct itself instead of being forced to finish.
+                allowed_name = (
+                    "ask_env" if previous_function.get("name") == "ask_env" else None
                 )
+            elif (
+                previous_function.get("name") == "ask_env"
+                and bool(previous_args.get("readonly"))
             ):
                 allowed_name = "ask_env"
             else:
@@ -226,13 +251,7 @@ class BudgetedClient:
             # PersonAgent.step() has already supplied the readonly observation
             # in the initial participant prompt.  Permit the model to choose
             # either its structured decision or a waiting finish.
-            has_initial_observation = any(
-                isinstance(message.get("content"), str)
-                and '"observations": [' in message["content"]
-                and "<risk_sharing_turn>" in message["content"]
-                for message in messages
-                if isinstance(message, dict)
-            )
+            has_initial_observation = ScriptedLLMClient._participant_turn(messages) is not None
             allowed_name = "ask_env" if not has_initial_observation else None
 
         if allowed_name is None:
@@ -304,14 +323,32 @@ class BudgetedClient:
 
     async def call(self, model: str | None = None, messages=None, **kwargs: Any):
         messages = list(messages or [])
+        phase = kwargs.pop("participant_phase", None)
+        if phase is not None and (
+            phase != "deliberation"
+            or not self.enforce_participant_progression
+            or self.enforce_router_progression
+        ):
+            raise ValueError("Only the participant client may request deliberation.")
+        is_deliberation = phase == "deliberation"
+        if is_deliberation:
+            # Never reuse tools cached by an earlier action or restored turn.
+            kwargs.pop("tools", None)
+            kwargs.pop("tool_choice", None)
         if self.enforce_router_progression and self._restrict_router_tools(messages, kwargs):
             message = SimpleNamespace(content="Environment request completed.", tool_calls=[])
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
         self.budget.reserve()
         request_index = self.budget.calls
         self.actual_calls += 1
-        self._restrict_participant_tools(messages, kwargs)
-        kwargs.setdefault("max_output_tokens", self.max_output_tokens)
+        if is_deliberation:
+            self.deliberation_calls += 1
+            kwargs["max_output_tokens"] = min(
+                kwargs.get("max_output_tokens", 512), 512, self.max_output_tokens,
+            )
+        else:
+            self._restrict_participant_tools(messages, kwargs)
+            kwargs.setdefault("max_output_tokens", self.max_output_tokens)
         # LLMClient clamps this to one actual attempt; no unbounded retry loop.
         kwargs["max_retries"] = 0
         started = time.monotonic()
@@ -327,6 +364,8 @@ class BudgetedClient:
                     "model_call_finished",
                     agent_id=self.agent_id,
                     role="router" if self.enforce_router_progression else "participant",
+                    phase=("deliberation" if is_deliberation else
+                           "routing" if self.enforce_router_progression else "decision"),
                     request_index=request_index,
                     duration_seconds=round(time.monotonic() - started, 6),
                     ok=error_type is None,
@@ -334,6 +373,23 @@ class BudgetedClient:
                 )
         self.budget.record_usage(response)
         return response
+
+    def record_participant_deliberation(self, *, observation, messages, review_text):
+        """Keep explicit review text in a researcher log, never Router context."""
+
+        if not self.enforce_participant_progression or self.enforce_router_progression:
+            raise ValueError("Only the participant client may record deliberation.")
+        if observation.get("agent_id") != self.agent_id:
+            raise ValueError("Deliberation observation does not match the bound participant.")
+        if self.deliberation_logger is not None:
+            self.deliberation_logger.write(
+                "participant_deliberation",
+                agent_id=self.agent_id, pair_id=self.pair_id,
+                period=observation.get("current_period"),
+                decision_id=observation.get("decision_id"), task=observation.get("task"),
+                decision_source="participant_model", observation=observation,
+                model_messages=messages, review_text=review_text,
+            )
 
     def take_token_stats(self) -> dict[str, dict[str, int]]:
         getter = getattr(self.inner, "take_token_stats", None)
@@ -390,15 +446,15 @@ class ScriptedLLMClient:
             if not isinstance(payload, dict):
                 continue
             observations = payload.get("observations") or []
+            if not isinstance(observations, list):
+                continue
             for item in reversed(observations):
                 value = item.get("observation") if isinstance(item, dict) else None
-                if isinstance(value, str):
+                if isinstance(value, dict):
                     try:
-                        observation = json.loads(value)
-                    except json.JSONDecodeError:
+                        return int(payload["agent_id"]), value
+                    except (KeyError, TypeError, ValueError):
                         continue
-                    if isinstance(observation, dict):
-                        return int(payload["agent_id"]), observation
         return None
 
     @staticmethod
@@ -418,6 +474,18 @@ class ScriptedLLMClient:
             return self._response(
                 name=request["tool"], arguments=copy.deepcopy(request["arguments"])
             )
+        if messages and "<participant_deliberation>" in str(messages[-1].get("content", "")):
+            turn = self._participant_turn(messages)
+            if turn is None:
+                raise ValueError("A participant review requires its own observation.")
+            participant_id, observation = turn
+            # Offline fixture, not a learned economic strategy or conclusion.
+            return self._response(content=(
+                f"Participant {participant_id}, period {observation['current_period']}: "
+                f"I have {len(observation.get('history', []))} settled pair records. "
+                f"I will use my scripted test policy for the {observation['task']} task "
+                "and check the current observation's constraints before submitting."
+            ))
         if tool_messages and not str(tool_messages[-1].get("content", "")).startswith("ERROR:"):
             return self._response(
                 name="finish",
@@ -445,6 +513,22 @@ class ScriptedLLMClient:
                 },
             )
         participant_id, observation = participant_turn
+        if observation.get("task") == "insurance":
+            # Test fixture only: distinct, deterministic yes/no choices are
+            # produced on the participant side, never by the routing client.
+            purchase = participant_id % 2 == 0
+            return self._response(
+                name="ask_env",
+                arguments={
+                    "instruction": (
+                        "This is my choice for the current offer.\n"
+                        "decision_type: insurance\n"
+                        f"decision_id: {observation['decision_id']}\n"
+                        f"purchase: {str(purchase).lower()}"
+                    ),
+                    "readonly": False,
+                },
+            )
         if observation.get("task") != "transfer":
             return self._response(
                 name="finish",
@@ -493,14 +577,17 @@ def _select_payment_period(completed_periods: list[int], seed: int) -> int:
     return completed_periods[payment_rng.randrange(len(completed_periods))]
 
 
-def _make_run_dir(path: Path | None) -> Path:
+def _make_run_dir(
+    path: Path | None, treatment: protocol_spec.Treatment = protocol_spec.Treatment.BASELINE,
+) -> Path:
     if path is not None:
         run_dir = path.expanduser().resolve()
         if run_dir.exists():
             raise RuntimeConfigError(f"run directory already exists: {run_dir}")
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        run_dir = PROJECT_ROOT / "experiments" / "baseline" / "runs" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+        experiment = treatment.value.lower()
+        run_dir = PROJECT_ROOT / "experiments" / experiment / "runs" / f"{stamp}-{uuid.uuid4().hex[:8]}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
@@ -533,10 +620,11 @@ def _safe_action_records(
             row["router_action"] = "direct_observation"
             row["router_model_called"] = False
             row["decision_source"] = "participant_observation_request"
-        elif function_name == "submit_decision":
+        elif function_name in {"submit_decision", "submit_insurance_decision"}:
+            value_field = "purchase" if function_name == "submit_insurance_decision" else "amount"
             row["router_action"] = "router_forward"
             row["router_model_called"] = True
-            row["submitted_amount"] = kwargs.get("amount")
+            row[f"submitted_{value_field}"] = kwargs.get(value_field)
             row["decision_id"] = kwargs.get("decision_id")
             row["receipt"] = record.get("return_value")
             row["environment_receipt"] = record.get("return_value")
@@ -547,7 +635,8 @@ def _safe_action_records(
                     if item.get("agent_id") == agent_id
                     and item.get("decision_id") == kwargs.get("decision_id")
                     and item.get("decision_type") == kwargs.get("decision_type")
-                    and item.get("amount") == kwargs.get("amount")
+                    and item.get(value_field) == kwargs.get(value_field)
+                    and type(item.get(value_field)) is type(kwargs.get(value_field))
                 ),
                 None,
             )
@@ -556,14 +645,14 @@ def _safe_action_records(
                 row["participant_model_output"] = {
                     "decision_type": participant.get("decision_type"),
                     "decision_id": participant.get("decision_id"),
-                    "amount": participant.get("amount"),
+                    value_field: participant.get(value_field),
                 }
                 if isinstance(participant.get("participant_observation"), dict):
                     row["participant_model_message"] = {
                         "observation": participant["participant_observation"],
                         "contains_observation": True,
                     }
-                row["participant_amount"] = participant.get("amount")
+                row[f"participant_{value_field}"] = participant.get(value_field)
                 row["participant_raw_request"] = _redact_text(participant.get("raw_request", ""))
                 row["participant_variables"] = _safe_log_value(
                     participant.get("participant_variables", {})
@@ -590,11 +679,17 @@ async def _run_async(
     agent_turns: int,
     agent_concurrency: int,
     timeout_seconds: float,
+    participant_deliberation: bool = False,
+    treatment: protocol_spec.Treatment = protocol_spec.Treatment.BASELINE,
+    forced_assignment_probabilities: tuple[float, float, float] | None = None,
+    assignment_seed: int | None = None,
 ) -> dict[str, Any]:
+    _validate_population(participants, agent_concurrency)
     run_log = RunLogger(run_dir / "run.log")
     run_log.write(
         "configuration_loaded",
         backend=cfg.backend,
+        treatment=treatment.value,
         config_status=cfg.safe_status(),
         participants=participants,
         completed_period_limit=completed_period_limit,
@@ -603,6 +698,8 @@ async def _run_async(
         max_output_tokens=max_output_tokens,
         agent_concurrency=agent_concurrency,
         timeout_seconds=timeout_seconds,
+        participant_deliberation=participant_deliberation,
+        observation_presentation=PRESENTATION_VERSION,
     )
 
     # Imports that load AgentSociety2 configuration occur only after the
@@ -621,23 +718,29 @@ async def _run_async(
         RiskSharingEnv, RiskSharingReActRouter, RiskSharingRouterAdapter,
     )
 
-    if participants != 4:
-        raise ValueError("this smoke entry is fixed to four participants / two pairs")
     if completed_period_limit < 1:
         raise ValueError("completed_period_limit must be positive")
-    if not 1 <= agent_concurrency <= participants:
-        raise ValueError("agent_concurrency must be between 1 and participants")
 
     budget = RequestBudget(max_calls=request_limit)
     env = RiskSharingEnv(
         list(range(1, participants + 1)),
+        treatment=treatment,
         seed=seed,
         session_id=f"smoke-{uuid.uuid4().hex}",
+        forced_assignment_probabilities=forced_assignment_probabilities,
+        assignment_seed=assignment_seed,
     )
+    if env.assignment_configuration is not None:
+        run_log.write("insurance_assignment_configuration", **env.assignment_configuration)
     participant_clients: list[BudgetedClient] = []
     router_clients: list[BudgetedClient] = []
 
     call_log = RunLogger(run_dir / "run.log", announce=False)
+    deliberation_log = None
+    if participant_deliberation:
+        review_path = run_dir / "participant_deliberations.jsonl"
+        review_path.touch()
+        deliberation_log = RunLogger(review_path, announce=False)
 
     def _make_agent_services(agent_id: int) -> tuple[RiskSharingRouterAdapter, ServiceProxy]:
         """Give each participant its own model clients and trusted Router adapter."""
@@ -653,6 +756,8 @@ async def _run_async(
             participant_inner, budget, max_output_tokens,
             enforce_participant_progression=True,
             call_logger=call_log, agent_id=agent_id,
+            deliberation_logger=deliberation_log,
+            pair_id=env.pair_by_agent[agent_id],
         )
         router_client = BudgetedClient(
             router_inner, budget, max_output_tokens,
@@ -696,9 +801,11 @@ async def _run_async(
     workspace_root = run_dir / "agents"
     agent_config = {
         "enable_memory": False,
+        "participant_deliberation": participant_deliberation,
         "enable_todo_list": False,
         "max_react_turns": agent_turns,
-        "disabled_skill_ids": ["*"],
+        # RiskSharingParticipant enforces an empty skill runtime; 2.9.0's
+        # disabled_skill_ids accepts exact IDs, not a '*' wildcard.
     }
     for agent_id in range(1, participants + 1):
         RiskSharingParticipant.create(
@@ -730,6 +837,7 @@ async def _run_async(
     started = time.monotonic()
     participant_decision_cursor = 0
     participant_rejection_cursor = 0
+    assignment_cursor = 0
     agent_semaphore = asyncio.Semaphore(agent_concurrency)
 
     async def _step_one_agent(agent_id: int) -> list[dict[str, Any]]:
@@ -754,6 +862,7 @@ async def _run_async(
             "scheduler_step_started",
             scheduler_step=scheduler_steps,
             current_period=env.current_period,
+            stage=env.stage.value,
             completed_periods=list(env.completed_periods),
         )
         for adapter, _proxy in agent_services.values():
@@ -796,6 +905,8 @@ async def _run_async(
                     else None,
                     "submitted_amount": row.get("submitted_amount"),
                     "participant_amount": row.get("participant_amount"),
+                    "submitted_purchase": row.get("submitted_purchase"),
+                    "participant_purchase": row.get("participant_purchase"),
                     "decision_source": row.get("decision_source"),
                     "error": row.get("error"),
                 }
@@ -822,13 +933,32 @@ async def _run_async(
             break
         before = len(env.completed_periods)
         period_before = env.current_period
+        stage_before = env.stage.value
         await control_adapter.step(1, now)
+        assignments = env.insurance_assignments
+        new_assignments = assignments[assignment_cursor:]
+        assignment_cursor = len(assignments)
+        if new_assignments:
+            # Record computer assignments separately from participant decisions.
+            run_log.write(
+                "insurance_assigned", scheduler_step=scheduler_steps,
+                assignments=new_assignments,
+            )
+            _jsonl_append(action_path, [
+                {**record, "framework_step": scheduler_steps,
+                 "action": "insurance_assignment", "ok": True,
+                 "decision_source": "environment_random",
+                 "router_action": "not_applicable", "router_model_called": False}
+                for record in new_assignments
+            ])
         after = len(env.completed_periods)
         run_log.write(
             "scheduler_step_finished",
             scheduler_step=scheduler_steps,
             period_before=period_before,
             period_after=env.current_period,
+            stage_before=stage_before,
+            stage_after=env.stage.value,
             settled_period=env.completed_periods[-1] if after > before else None,
             finished=env.finished,
             completed_periods=list(env.completed_periods),
@@ -848,6 +978,21 @@ async def _run_async(
 
     # Records come directly from the environment, never from model text.
     _jsonl_append(records_path, env.history)
+    insurance_decisions = [
+        {
+            "agent_id": agent_id, "pair_id": env.pair_by_agent[agent_id],
+            "partner_id": env.partner_by_agent[agent_id],
+            "period": period, "decision_id": token, "purchase": value,
+            "treatment": treatment.value,
+        }
+        for token, (agent_id, period, decision_type, value) in env._decision_receipts.items()
+        if decision_type == "insurance"
+    ]
+    if treatment is protocol_spec.Treatment.VOLUNTARY_INSURANCE_25:
+        _jsonl_append(run_dir / "insurance_decisions.jsonl", insurance_decisions)
+    insurance_assignments = env.insurance_assignments
+    if treatment is protocol_spec.Treatment.FORCED_INSURANCE_25:
+        _jsonl_append(run_dir / "insurance_assignments.jsonl", insurance_assignments)
     payment_period: int | None = None
     payment_path: Path | None = None
     payment_records: list[dict[str, Any]] = []
@@ -884,9 +1029,29 @@ async def _run_async(
         len(env.completed_periods) if full_session else completed_period_limit
     )
     records_complete = (
-        len(unique_decisions) == 2 * expected_period_count
-        and len(env.history) == 4 * expected_period_count
+        len(unique_decisions) == len(env.pair_members) * expected_period_count
+        and len(env.history) == participants * expected_period_count
+        and len(insurance_decisions) == (
+            participants
+            if treatment is protocol_spec.Treatment.VOLUNTARY_INSURANCE_25
+            and expected_period_count >= protocol_spec.INSURANCE_DECISION_PERIOD
+            else 0
+        )
     )
+    if treatment is protocol_spec.Treatment.FORCED_INSURANCE_25:
+        # Settling period 15 already prepares period 16. Retain the actual
+        # assignments even in a smoke that stops before agents act in 16.
+        assignment_expected = env.current_period >= protocol_spec.INSURANCE_DECISION_PERIOD
+        records_complete = records_complete and (
+            len(insurance_assignments) == (participants if assignment_expected else 0)
+            and (
+                not assignment_expected
+                or all(
+                    any(row["insured"] for row in insurance_assignments if row["pair_id"] == pair_id)
+                    for pair_id in env.pair_members
+                )
+            )
+        )
     if full_session:
         successful = (
             stop_reason == "natural_termination"
@@ -909,13 +1074,27 @@ async def _run_async(
 
     manifest = {
         "schema_version": 1,
+        "observation_presentation": PRESENTATION_VERSION,
+        "observation_presentation_sha256": _file_hash(PROJECT_ROOT / "custom/agents/observation_presentation.py"),
         "run_mode": "full_session" if full_session else "smoke",
         "backend": cfg.backend,
+        "treatment": treatment.value,
         "router": "ReActRouter",
         "router_model": cfg.model,
         "router_api_enabled": cfg.backend == "llm",
         "observation_routing": "direct_via_trusted_adapter",
         "transfer_routing": "react_router",
+        "insurance_decision_count": len(insurance_decisions),
+        "insurance_decisions_file": (
+            "insurance_decisions.jsonl"
+            if treatment is protocol_spec.Treatment.VOLUNTARY_INSURANCE_25 else None
+        ),
+        "insurance_assignment_count": len(insurance_assignments),
+        "insurance_assignments_file": (
+            "insurance_assignments.jsonl"
+            if treatment is protocol_spec.Treatment.FORCED_INSURANCE_25 else None
+        ),
+        "insurance_assignment_configuration": env.assignment_configuration,
         "finish_after_receipt": "local",
         "router_model_requests": sum(client.actual_calls for client in router_clients),
         "participant_model_requests": sum(client.actual_calls for client in participant_clients),
@@ -926,6 +1105,13 @@ async def _run_async(
         "model": cfg.model,
         "base_url": cfg.base_url,
         "thinking": "disabled",
+        "participant_deliberation": participant_deliberation,
+        "participant_deliberation_requests": sum(client.deliberation_calls for client in participant_clients),
+        "participant_deliberation_file": "participant_deliberations.jsonl" if participant_deliberation else None,
+        "deliberation_prompt_sha256": (
+            _file_hash(PROJECT_ROOT / "custom" / "agents" / "risk_sharing_deliberation.md")
+            if participant_deliberation else None
+        ),
         "request_limit": request_limit,
         "max_output_tokens": max_output_tokens,
         "router_max_steps": router_steps,
@@ -944,27 +1130,51 @@ async def _run_async(
         "failure_details": failure_details,
         "log_file": "run.log",
         "prompt_sha256": _file_hash(PROJECT_ROOT / "custom" / "agents" / "risk_sharing_participant.md"),
+        "insurance_prompt_sha256": (
+            _file_hash(PROJECT_ROOT / "custom" / "agents" / "risk_sharing_insurance.md")
+            if treatment is protocol_spec.Treatment.VOLUNTARY_INSURANCE_25 else None
+        ),
         "environment": "shared in-process RiskSharingEnv via RiskSharingRouterAdapter",
     }
     _write_manifest(run_dir / "manifest.json", manifest)
 
     summary_lines = [
-        f"# Baseline {'full session' if full_session else 'smoke'} ({cfg.backend})",
+        f"# {treatment.value} {'full session' if full_session else 'smoke'} ({cfg.backend})",
         "",
         f"- success: `{successful}`",
+        f"- observation_presentation: `{PRESENTATION_VERSION}`",
         f"- stop_reason: `{stop_reason}`",
+        f"- participants: `{participants}`",
+        f"- pairs: `{len(env.pair_members)}`",
         f"- completed_periods: `{env.completed_periods}`",
         f"- model_requests: `{budget.calls}/{request_limit}`",
         f"- participant_model_requests: `{sum(client.actual_calls for client in participant_clients)}`",
         f"- router_model_requests: `{sum(client.actual_calls for client in router_clients)}`",
+        f"- participant_deliberation: `{participant_deliberation}`",
+        f"- participant_deliberation_requests: `{sum(client.deliberation_calls for client in participant_clients)}`",
         "- observation_routing: `direct_via_trusted_adapter`",
         "- finish_after_receipt: `local`",
         f"- agent_concurrency: `{agent_concurrency}`",
         f"- output_tokens: `{budget.output_tokens}`",
-        "",
-        "## Pair-period settlements",
+        f"- insurance decisions: `{len(insurance_decisions)}`",
         "",
     ]
+    if participant_deliberation:
+        summary_lines.append(
+            "参与者的简短决策评估见 [participant_deliberations.jsonl](participant_deliberations.jsonl)；"
+            "最终行动见 [agent_actions.jsonl](agent_actions.jsonl)。评估不等同于模型内部思考记录。\n"
+        )
+    if treatment is protocol_spec.Treatment.VOLUNTARY_INSURANCE_25:
+        report = import_module("experiments.25v.report")
+        summary_lines.append(report.render_insurance_section(
+            manifest, insurance_decisions, env.history, report.read_jsonl(action_path),
+        ))
+    elif treatment is protocol_spec.Treatment.FORCED_INSURANCE_25:
+        report = import_module("experiments.25f.report")
+        summary_lines.append(report.render_insurance_section(
+            manifest, insurance_assignments, env.history,
+        ))
+    summary_lines.extend(["", "## Pair-period settlements", ""])
     for period in sorted({int(r["period"]) for r in env.history}):
         for pair_id in sorted(env.pair_history):
             rows = [r for r in env.pair_history[pair_id] if int(r["period"]) == period]
@@ -999,6 +1209,19 @@ async def _run_async(
             "Payment selection is not performed in smoke mode; use `--full-session` "
             "for natural termination and payment-period selection."
         )
+    summary_text = "\n".join(summary_lines) + "\n"
+    try:
+        from experiments.report import add_report_link, write_visual_report
+
+        write_visual_report(
+            run_dir, manifest, env.history, insurance_decisions,
+            assignments=insurance_assignments,
+        )
+        summary_text = add_report_link(summary_text)
+    except Exception as exc:
+        # Presentation must not change an already settled experimental outcome.
+        run_log.write("visual_report_failed", error=_redact_text(exc))
+        summary_text += "\n交互报告未生成；文字记录完整，原因见 run.log。\n"
     run_log.write(
         "run_finished",
         success=successful,
@@ -1009,27 +1232,37 @@ async def _run_async(
         participant_model_requests=sum(client.actual_calls for client in participant_clients),
         failure_details=failure_details,
     )
-    (run_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    (run_dir / "summary.md").write_text(summary_text, encoding="utf-8")
     return manifest
 
 
 def run_experiment(**kwargs: Any) -> dict[str, Any]:
-    """Run a bounded smoke or a natural-termination full Baseline session."""
+    """Run a bounded smoke or a natural-termination session."""
 
+    if "observation_presentation" in kwargs:
+        raise TypeError("observation_presentation is not a configurable run option")
+    participants = kwargs.get("participants", 4)
+    agent_concurrency = kwargs.get("agent_concurrency", 1)
+    _validate_population(participants, agent_concurrency)
+    treatment = protocol_spec.Treatment(kwargs.get("treatment", protocol_spec.Treatment.BASELINE))
+    assignment_probabilities = validate_assignment_configuration(
+        treatment, kwargs.get("forced_assignment_probabilities"), kwargs.get("assignment_seed"),
+    )
     backend = str(kwargs.get("backend", "scripted"))
     cfg = load_runtime_config(
         backend,
         env_path=kwargs.get("env_path"),
         request_timeout=float(kwargs.get("request_timeout", 60.0)),
     )
-    run_dir = _make_run_dir(kwargs.get("run_dir"))
+    run_dir = _make_run_dir(kwargs.get("run_dir"), treatment)
     try:
         timeout_seconds = float(
             kwargs.get("timeout_seconds", DEFAULT_EXPERIMENT_TIMEOUT_SECONDS)
         )
         coro = _run_async(
             cfg=cfg,
-            participants=int(kwargs.get("participants", 4)),
+            treatment=treatment,
+            participants=participants,
             completed_period_limit=int(kwargs.get("completed_period_limit", 3)),
             full_session=bool(kwargs.get("full_session", False)),
             seed=int(kwargs.get("seed", 2026)),
@@ -1038,8 +1271,11 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             max_output_tokens=int(kwargs.get("max_output_tokens", 2048)),
             router_steps=int(kwargs.get("router_steps", 6)),
             agent_turns=int(kwargs.get("agent_turns", 4)),
-            agent_concurrency=int(kwargs.get("agent_concurrency", 1)),
+            agent_concurrency=agent_concurrency,
             timeout_seconds=timeout_seconds,
+            participant_deliberation=bool(kwargs.get("participant_deliberation", False)),
+            forced_assignment_probabilities=assignment_probabilities,
+            assignment_seed=kwargs.get("assignment_seed"),
         )
         return asyncio.run(asyncio.wait_for(coro, timeout=timeout_seconds))
     except Exception as exc:
@@ -1052,7 +1288,10 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
         )
         manifest = {
             "schema_version": 1,
+            "observation_presentation": PRESENTATION_VERSION,
+            "observation_presentation_sha256": _file_hash(PROJECT_ROOT / "custom/agents/observation_presentation.py"),
             "backend": backend,
+            "treatment": treatment.value,
             "success": False,
             "stop_reason": "configuration_or_runtime_error",
             "error_type": type(exc).__name__,
@@ -1062,7 +1301,7 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
         }
         _write_manifest(run_dir / "manifest.json", manifest)
         (run_dir / "summary.md").write_text(
-            f"# Baseline smoke ({backend})\n\n- success: `False`\n- stop_reason: `configuration_or_runtime_error`\n- error: `{type(exc).__name__}: {safe_error}`\n\n- diagnostics: `run.log`\n",
+            f"# {treatment.value} run ({backend})\n\n- observation_presentation: `{PRESENTATION_VERSION}`\n- success: `False`\n- stop_reason: `configuration_or_runtime_error`\n- error: `{type(exc).__name__}: {safe_error}`\n\n- diagnostics: `run.log`\n",
             encoding="utf-8",
         )
         raise
@@ -1071,7 +1310,10 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("scripted", "llm"), required=True)
-    parser.add_argument("--participants", type=int, default=4)
+    parser.add_argument(
+        "--participants", type=int, default=4,
+        help="Even participant count, at least 2 (default: 4; use 20 for ten fixed pairs).",
+    )
     parser.add_argument(
         "--completed-period-limit",
         type=int,
@@ -1090,12 +1332,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--router-max-steps", type=int, default=6)
     parser.add_argument("--agent-max-turns", type=int, default=4)
     parser.add_argument(
+        "--participant-deliberation", action="store_true",
+        help=("Add one private participant review before each transfer or insurance choice. "
+              "Uses extra requests; does not enable provider-native thinking or persistent memory."),
+    )
+    parser.add_argument(
         "--agent-concurrency",
         type=int,
         default=1,
         help=(
             "Maximum number of participant Agents stepped concurrently per "
-            "period (default: 1; use 4 for all four Agents)."
+            "period, from 1 to --participants (default: 1; use 20 with 20 participants)."
         ),
     )
     parser.add_argument(
@@ -1108,8 +1355,35 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+def main(
+    argv: list[str] | None = None,
+    *, treatment: protocol_spec.Treatment = protocol_spec.Treatment.BASELINE,
+) -> int:
+    parser = _parser()
+    if treatment is protocol_spec.Treatment.VOLUNTARY_INSURANCE_25:
+        parser.description = "Run the 25V voluntary-insurance experiment with fixed pairs."
+        parser.set_defaults(completed_period_limit=31, request_limit=400)
+    elif treatment is protocol_spec.Treatment.FORCED_INSURANCE_25:
+        parser.description = "Run 25F with an explicit computer insurance-assignment distribution."
+        parser.set_defaults(completed_period_limit=31, request_limit=400)
+        parser.add_argument(
+            "--forced-assignment-probabilities", nargs=3, type=float, required=True,
+            metavar=("P_BOTH", "P_FIRST_ONLY", "P_SECOND_ONLY"),
+            help="Joint probabilities in fixed pair member order. Paper probabilities remain unresolved; no default.",
+        )
+        parser.add_argument(
+            "--assignment-seed", type=int,
+            help="Independent assignment RNG seed; derived from --seed when omitted.",
+        )
+    args = parser.parse_args(argv)
+    try:
+        _validate_population(args.participants, args.agent_concurrency)
+        validate_assignment_configuration(
+            treatment, getattr(args, "forced_assignment_probabilities", None),
+            getattr(args, "assignment_seed", None),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         cfg = load_runtime_config(
             args.backend,
@@ -1122,6 +1396,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({"config": cfg.safe_status(), "limits": {"requests": args.request_limit, "max_output_tokens": args.max_output_tokens, "timeout_seconds": args.timeout_seconds, "full_session": args.full_session, "agent_concurrency": args.agent_concurrency}}, ensure_ascii=False))
     try:
         manifest = run_experiment(
+            treatment=treatment,
             backend=args.backend,
             participants=args.participants,
             completed_period_limit=args.completed_period_limit,
@@ -1133,8 +1408,11 @@ def main(argv: list[str] | None = None) -> int:
             router_steps=args.router_max_steps,
             agent_turns=args.agent_max_turns,
             agent_concurrency=args.agent_concurrency,
+            participant_deliberation=args.participant_deliberation,
             timeout_seconds=args.timeout_seconds,
             request_timeout=args.request_timeout,
+            forced_assignment_probabilities=getattr(args, "forced_assignment_probabilities", None),
+            assignment_seed=getattr(args, "assignment_seed", None),
         )
     except Exception as exc:
         print(f"运行失败：{type(exc).__name__}: {exc}", file=sys.stderr)

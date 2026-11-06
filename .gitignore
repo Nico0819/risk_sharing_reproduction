@@ -4,3 +4,5 @@
 __pycache__/
 .pytest_cache/
 experiments/baseline/runs/
+experiments/25v/runs/
+experiments/25f/runs/

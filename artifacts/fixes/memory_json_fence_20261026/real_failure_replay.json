@@ -1,0 +1,14 @@
+{
+  "source_run": "experiments/fixed_preferences_memory_v1/runs/baseline/20261026T081152Z-1edfe2d0",
+  "agent_id": 5,
+  "period": 22,
+  "task": "waiting",
+  "request_index": 1084,
+  "raw_output_sha256": "36a2c356db575d8480d08aa6c970db964bc2de92191aa43ac1d01b3b9b9d08f8",
+  "parser_accepts_original_response": true,
+  "full_state_validation_passes": true,
+  "content_preserved": true,
+  "original_files_unchanged": 70,
+  "replayed_offline_only": true,
+  "api_calls": 0
+}

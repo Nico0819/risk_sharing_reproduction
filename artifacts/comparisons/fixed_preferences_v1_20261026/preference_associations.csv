@@ -1,0 +1,7 @@
+﻿dimension,level,agents,purchases,purchase_rate,pre_transfer_mean_opportunity_weighted,pre_transfer_opportunities
+risk_aversion,low,6,1,0.16666666666666666,82.25490196078431,51
+risk_aversion,medium,7,4,0.5714285714285714,81.11111111111111,54
+risk_aversion,high,7,6,0.8571428571428571,92.88888888888889,45
+advantageous_inequality_aversion,low,6,3,0.5,56.81818181818182,44
+advantageous_inequality_aversion,medium,7,5,0.7142857142857143,93.04347826086956,46
+advantageous_inequality_aversion,high,7,3,0.42857142857142855,99.58333333333333,60

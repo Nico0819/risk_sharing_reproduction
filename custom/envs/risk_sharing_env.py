@@ -1,8 +1,8 @@
 """Two-person income-sharing environment for a controlled simulation.
 
 The experimental constants live in :mod:`protocol.paper_spec`.  This module
-implements only the mechanical transfer rules; it deliberately contains no
-insurance, agent, LLM, or analysis logic.
+implements the mechanical transfer and insurance rules. Economic
+choices belong to participants, not to the environment or its Router adapter.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import random
 import re
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from typing import Any, Hashable, Iterator, Mapping, Sequence
 from agentsociety2 import EnvBase
 from agentsociety2.env import ReActRouter, tool
 
+from custom.insurance_assignment import ASSIGNMENT_OUTCOMES, validate_assignment_configuration
 from protocol import paper_spec as spec
 
 
@@ -43,10 +45,10 @@ def parse_participant_decision(
 
     if not isinstance(instruction, str):
         return None
-    required = {"decision_type", "decision_id", "amount"}
+    fields = {"decision_type", "decision_id", "amount", "purchase"}
     if variables is not None and not isinstance(variables, Mapping):
         raise ValueError("participant variables must be an object")
-    supplied = {key: value for key, value in (variables or {}).items() if key in required}
+    supplied = {key: value for key, value in (variables or {}).items() if key in fields}
     instruction = instruction.strip()
     if instruction.startswith(PARTICIPANT_DECISION_PREFIX):
         raw = instruction[len(PARTICIPANT_DECISION_PREFIX) :].strip()
@@ -65,7 +67,7 @@ def parse_participant_decision(
             raise ValueError("participant decision envelope is not valid JSON") from exc
     else:
         labels = list(re.finditer(
-            r"(?<!\w)(decision_type|decision_id|amount)[ \t]*[:=][ \t]*",
+            r"(?<!\w)(decision_type|decision_id|amount|purchase)[ \t]*[:=][ \t]*",
             instruction,
         ))
         if not labels and not supplied:
@@ -88,15 +90,21 @@ def parse_participant_decision(
                 if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)", value):
                     raise ValueError("participant amount must be a strict integer")
                 payload[name] = int(value)
+            elif name == "purchase":
+                if value not in {"true", "false"}:
+                    raise ValueError("participant purchase must be a strict boolean (true or false)")
+                payload[name] = value == "true"
     if not isinstance(payload, dict):
         raise ValueError("participant decision envelope must be a JSON object")
     for name, value in supplied.items():
         if name in payload and (type(payload[name]) is not type(value) or payload[name] != value):
             raise ValueError(f"participant {name} conflicts with variables")
         payload[name] = value
+    value_field = "purchase" if payload.get("decision_type") == "insurance" else "amount"
+    required = {"decision_type", "decision_id", value_field}
     if required.difference(payload):
         raise ValueError(
-            "participant decision must contain decision_type, decision_id, and amount"
+            f"participant decision must contain decision_type, decision_id, and {value_field}"
         )
     if set(payload).difference(required):
         raise ValueError("participant decision contains unexpected fields")
@@ -104,8 +112,10 @@ def parse_participant_decision(
         raise ValueError("participant decision_type must be a string")
     if not isinstance(payload["decision_id"], str):
         raise ValueError("participant decision_id must be a string")
-    if type(payload["amount"]) is not int:
+    if value_field == "amount" and type(payload["amount"]) is not int:
         raise ValueError("participant amount must be a strict integer")
+    if value_field == "purchase" and type(payload["purchase"]) is not bool:
+        raise ValueError("participant purchase must be a strict boolean")
     return payload
 
 
@@ -122,10 +132,15 @@ _PARTICIPANT_HISTORY_FIELDS = (
     "final_income",
 )
 
+_INSURANCE_HISTORY_FIELDS = (
+    "insurance_purchased", "insured", "insurance_cost", "insurance_payout",
+)
+
 
 class Stage(str, Enum):
-    """The two externally meaningful states in the environment."""
+    """Participant action stages; these are not researcher analysis phases."""
 
+    INSURANCE_DECISION = "insurance_decision"
     TRANSFER_DECISION = "transfer_decision"
     FINISHED = "finished"
 
@@ -159,6 +174,9 @@ class RiskSharingEnv(EnvBase):
         seed: int | None = None,
         rng: Any | None = None,
         session_id: str = "risk-sharing-session",
+        forced_assignment_probabilities: Sequence[float] | None = None,
+        assignment_seed: int | None = None,
+        assignment_rng: Any | None = None,
     ) -> None:
         super().__init__()
 
@@ -166,11 +184,18 @@ class RiskSharingEnv(EnvBase):
             normalized_treatment = spec.Treatment(treatment)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Unknown treatment: {treatment!r}") from exc
-        if normalized_treatment is not spec.Treatment.BASELINE:
-            raise NotImplementedError(
-                "RiskSharingEnv currently implements Baseline only; "
-                f"{normalized_treatment.value} is not implemented."
-            )
+        assignment_probabilities = validate_assignment_configuration(
+            normalized_treatment, forced_assignment_probabilities, assignment_seed,
+        )
+        if assignment_rng is not None:
+            if normalized_treatment is not spec.Treatment.FORCED_INSURANCE_25:
+                raise ValueError("assignment_rng is only allowed for 25F.")
+            if assignment_seed is not None:
+                raise ValueError("Pass either assignment_seed or assignment_rng, not both.")
+            if assignment_rng is rng:
+                raise ValueError("Income and insurance assignment must use independent RNG objects.")
+            if not callable(getattr(assignment_rng, "random", None)):
+                raise TypeError("assignment_rng must provide random().")
         if seed is not None and rng is not None:
             raise ValueError("Pass either seed or rng, not both.")
         if rng is not None and not all(
@@ -219,13 +244,42 @@ class RiskSharingEnv(EnvBase):
         self.completed_periods: list[int] = []
         self.ending_outcomes: dict[int, bool] = {}
         self._ending_drawn_periods: set[int] = set()
-        self._decision_receipts: dict[str, tuple[AgentId, int, str, int]] = {}
+        self._decision_receipts: dict[str, tuple[AgentId, int, str, int | bool]] = {}
+        self._insurance_choices: dict[AgentId, bool] = {}
+        self._forced_insurance: dict[AgentId, bool] = {}
+        self._insurance_assignment_records: list[dict[str, Any]] = []
+        self._assignment_configuration: dict[str, Any] | None = None
+        self._assignment_rng = None
+        if assignment_probabilities is not None:
+            # A separate stream preserves matching, income shocks and ending
+            # draws under the original experiment seed across treatments.
+            if assignment_rng is None:
+                if assignment_seed is None:
+                    assignment_seed = (
+                        int.from_bytes(hashlib.sha256(
+                            f"risk-sharing-25f-assignment-v1:{seed}".encode()
+                        ).digest(), "big")
+                        if seed is not None else random.SystemRandom().getrandbits(128)
+                    )
+                self._assignment_rng = random.Random(assignment_seed)
+            else:
+                self._assignment_rng = assignment_rng
+            self._assignment_configuration = {
+                "probabilities": dict(zip(ASSIGNMENT_OUTCOMES, assignment_probabilities)),
+                "seed": assignment_seed,
+                "rng_source": "injected" if assignment_rng is not None else "seeded",
+                "probability_source": "explicit_run_configuration",
+                "paper_probability_resolved": False,
+            }
+        # EnvBase registers all decorated tools. Publish only the tools of the
+        # current stage; otherwise tool schemas would reveal the future option.
+        self._stage_tool_catalog = copy.deepcopy(self._llm_tools)
         self._rounds: dict[int, _PairRound] = {}
         self._trusted_caller: ContextVar[AgentId | None] = ContextVar(
             f"risk_sharing_caller_{id(self)}", default=None
         )
         self._expected_participant_decision: ContextVar[
-            tuple[str, str, int] | None
+            tuple[str, str, int | bool] | None
         ] = ContextVar(
             f"risk_sharing_expected_decision_{id(self)}", default=None
         )
@@ -283,7 +337,7 @@ class RiskSharingEnv(EnvBase):
 
     @contextmanager
     def expected_participant_decision(
-        self, decision_type: str, decision_id: str, amount: int
+        self, decision_type: str, decision_id: str, amount: int | bool
     ) -> Iterator[None]:
         """Lock the exact participant payload accepted for this request."""
 
@@ -322,11 +376,11 @@ class RiskSharingEnv(EnvBase):
                 "decision_source": "participant_model",
                 "decision_type": decision["decision_type"],
                 "decision_id": decision["decision_id"],
-                "amount": decision["amount"],
+                **{name: decision[name] for name in ("amount", "purchase") if name in decision},
                 **({"raw_request": raw_request} if raw_request else {}),
                 "participant_variables": {
                     name: copy.deepcopy(value) for name, value in (variables or {}).items()
-                    if name in {"decision_type", "decision_id", "amount"}
+                    if name in {"decision_type", "decision_id", "amount", "purchase"}
                 },
                 **(
                     {"participant_observation": copy.deepcopy(dict(observation))}
@@ -352,7 +406,24 @@ class RiskSharingEnv(EnvBase):
     def _prepare_period(self) -> None:
         if self.finished:
             return
+        if (
+            self.treatment is spec.Treatment.FORCED_INSURANCE_25
+            and self.current_period == spec.INSURANCE_DECISION_PERIOD
+        ):
+            self._assign_forced_insurance()
+        if (
+            self.treatment is spec.Treatment.VOLUNTARY_INSURANCE_25
+            and self.current_period == spec.INSURANCE_DECISION_PERIOD
+            and len(self._insurance_choices) != len(self.participants)
+        ):
+            # Appendix C, Fig. C.4: choose before the income shock. Neither
+            # incomes nor ending draws are consumed during this substage.
+            self.stage = Stage.INSURANCE_DECISION
+            self._rounds = {}
+            self._publish_stage_tools()
+            return
         self.stage = Stage.TRANSFER_DECISION
+        self._publish_stage_tools()
         self._rounds = {}
         for pair_id, members in self.pair_members.items():
             first_is_high = self._rng.random() < spec.HIGH_INCOME_MEMBER_PROBABILITY
@@ -363,7 +434,11 @@ class RiskSharingEnv(EnvBase):
                 low_member: spec.LOW_RANDOM_INCOME,
             }
             income_before_transfer = {
-                agent_id: spec.FIXED_INCOME + amount
+                agent_id: (
+                    spec.FIXED_INCOME + amount
+                    - (spec.INSURANCE_COST if self._is_insured(agent_id) else 0)
+                    + self._insurance_payout(agent_id, amount)
+                )
                 for agent_id, amount in random_income.items()
             }
             self._rounds[pair_id] = _PairRound(
@@ -373,7 +448,109 @@ class RiskSharingEnv(EnvBase):
                 income_before_transfer=income_before_transfer,
             )
 
-    def _decision_id(self, pair_id: int, agent_id: AgentId) -> str:
+    def _publish_stage_tools(self) -> None:
+        allowed = {"get_observation"}
+        if self.stage is Stage.INSURANCE_DECISION:
+            allowed.add("submit_insurance_decision")
+        elif self.stage is Stage.TRANSFER_DECISION:
+            allowed.add("submit_decision")
+        self._set_llm_tools([
+            item for item in self._stage_tool_catalog
+            if item["function"]["name"] in allowed
+        ])
+
+    def _is_insured(self, agent_id: AgentId) -> bool:
+        coverage = (
+            self._forced_insurance
+            if self.treatment is spec.Treatment.FORCED_INSURANCE_25
+            else self._insurance_choices
+        )
+        return (
+            spec.INSURANCE_ACTIVE_START_PERIOD <= self.current_period <= spec.INSURANCE_ACTIVE_END_PERIOD
+            and coverage.get(agent_id, False)
+        )
+
+    @property
+    def assignment_configuration(self) -> dict[str, Any] | None:
+        """Researcher-only distribution and seed; never part of observations."""
+
+        return copy.deepcopy(self._assignment_configuration)
+
+    @property
+    def insurance_assignments(self) -> list[dict[str, Any]]:
+        """Detached computer assignment records, separate from model decisions."""
+
+        return copy.deepcopy(self._insurance_assignment_records)
+
+    def _assign_forced_insurance(self) -> None:
+        """Assign once before period-16 income, only at the scheduler boundary."""
+
+        if self._forced_insurance:
+            return
+        assert self._assignment_configuration is not None
+        assert self._assignment_rng is not None
+        probabilities = self._assignment_configuration["probabilities"]
+        possible = [(name, probability) for name, probability in probabilities.items() if probability > 0]
+        coverage_by_outcome = {
+            "both_insured": (True, True),
+            "first_only": (True, False),
+            "second_only": (False, True),
+        }
+        coverage = {}
+        records = []
+        for pair_id, members in self.pair_members.items():
+            draw = self._assignment_rng.random()
+            if type(draw) not in (int, float) or not 0 <= draw < 1 or not math.isfinite(draw):
+                raise ValueError("Assignment RNG must return a finite number in [0, 1).")
+            # The validator tolerates floating-point sums close to one. Any
+            # trailing rounding residue belongs to the last positive outcome,
+            # never to a combination explicitly assigned probability zero.
+            outcome = possible[-1][0]
+            cumulative = 0.0
+            for candidate, probability in possible:
+                cumulative += probability
+                if draw < cumulative:
+                    outcome = candidate
+                    break
+            statuses = coverage_by_outcome[outcome]
+            for agent_id, insured in zip(members, statuses):
+                coverage[agent_id] = insured
+                records.append({
+                    "agent_id": agent_id, "pair_id": pair_id,
+                    "partner_id": self.partner_by_agent[agent_id],
+                    "period": self.current_period, "insured": insured,
+                    "assignment_source": "environment_random",
+                    "assignment_outcome": outcome, "assignment_draw": draw,
+                    "pair_members": list(members), "treatment": self.treatment.value,
+                })
+        self._forced_insurance = coverage
+        self._insurance_assignment_records = records
+
+    def _insurance_payout(self, agent_id: AgentId, random_income: int) -> int:
+        if not self._is_insured(agent_id):
+            return 0
+        return (
+            spec.INSURANCE_PAYOUT_LOW_RANDOM_INCOME
+            if random_income == spec.LOW_RANDOM_INCOME
+            else spec.INSURANCE_PAYOUT_HIGH_RANDOM_INCOME
+        )
+
+    def _insurance_account(self, agent_id: AgentId, random_income: int) -> dict[str, Any]:
+        original_status = (
+            {"insurance_assigned": self._forced_insurance.get(agent_id)}
+            if self.treatment is spec.Treatment.FORCED_INSURANCE_25
+            else {"insurance_purchased": self._insurance_choices.get(agent_id)}
+        )
+        return {
+            **original_status,
+            "insured": self._is_insured(agent_id),
+            "insurance_cost": spec.INSURANCE_COST if self._is_insured(agent_id) else 0,
+            "insurance_payout": self._insurance_payout(agent_id, random_income),
+        }
+
+    def _decision_id(
+        self, pair_id: int, agent_id: AgentId, decision_type: str = "transfer",
+    ) -> str:
         """Return a stable opaque token for this participant's current turn.
 
         The digest is deterministic and does not consume the experiment RNG.
@@ -382,15 +559,18 @@ class RiskSharingEnv(EnvBase):
         seed, or horizon metadata) to a participant.
         """
 
-        material = repr(
-            (
-                "risk-sharing-decision-v1",
-                self.session_id,
-                self.current_period,
-                pair_id,
-                agent_id,
-            )
-        ).encode("utf-8")
+        identity = (
+            "risk-sharing-decision-v1",
+            self.session_id,
+            self.current_period,
+            pair_id,
+            agent_id,
+        )
+        # Preserve existing transfer tokens; distinguish the two decisions in
+        # period 16 without consuming income/termination RNG state.
+        if decision_type != "transfer":
+            identity += (decision_type,)
+        material = repr(identity).encode("utf-8")
         return f"decision-{hashlib.sha256(material).hexdigest()[:32]}"
 
     def _sample_ending_after_settlement(self) -> bool:
@@ -455,6 +635,8 @@ class RiskSharingEnv(EnvBase):
                     "income_before_transfer": state.income_before_transfer[agent_id],
                     "final_income": final_income[agent_id],
                 }
+                if self.treatment is not spec.Treatment.BASELINE:
+                    record.update(self._insurance_account(agent_id, state.random_income[agent_id]))
                 new_records.append(record)
                 self.history.append(record)
                 self.pair_history[pair_id].append(record)
@@ -467,7 +649,19 @@ class RiskSharingEnv(EnvBase):
         """Return only fields that belong in a participant's pair view."""
 
         return [
-            {field: copy.deepcopy(record[field]) for field in _PARTICIPANT_HISTORY_FIELDS}
+            {
+                field: copy.deepcopy(record[field])
+                for field in _PARTICIPANT_HISTORY_FIELDS + (
+                    (
+                        ("insurance_assigned", "insured", "insurance_cost", "insurance_payout")
+                        if self.treatment is spec.Treatment.FORCED_INSURANCE_25
+                        else _INSURANCE_HISTORY_FIELDS
+                    )
+                    if self.treatment is not spec.Treatment.BASELINE
+                    and record["period"] >= spec.INSURANCE_OPPORTUNITY_REVEALED_PERIOD
+                    else ()
+                )
+            }
             for record in self.pair_history[pair_id]
         ]
 
@@ -475,8 +669,8 @@ class RiskSharingEnv(EnvBase):
         readonly=True,
         name="get_observation",
         description=(
-            "Read the caller's current pair observation once. If task is transfer, "
-            "use the returned decision_id and immediately call submit_decision; "
+            "Read the caller's current pair observation once. Follow its current task "
+            "using the returned decision_id and legal choices; "
             "do not repeat this observation in the same request."
         ),
         kind="observe",
@@ -497,11 +691,40 @@ class RiskSharingEnv(EnvBase):
                 "history": self._participant_history(pair_id),
             }
 
+        if self.stage is Stage.INSURANCE_DECISION:
+            submitted = agent_id in self._insurance_choices
+            pair_ready = all(member in self._insurance_choices for member in self.pair_members[pair_id])
+            return {
+                "current_period": self.current_period,
+                "stage": self.stage.value,
+                "task": "waiting" if submitted else "insurance",
+                "decision_id": self._decision_id(pair_id, agent_id, "insurance"),
+                "agent_id": agent_id,
+                "partner_id": partner_id,
+                "insurance_submitted": submitted,
+                "own_purchase": self._insurance_choices.get(agent_id),
+                **({"partner_purchase": self._insurance_choices[partner_id]} if pair_ready else {}),
+                "legal_insurance_choices": [True, False],
+                "insurance_offer": {
+                    "cost_per_period": spec.INSURANCE_COST,
+                    "payout_if_low_random_income": spec.INSURANCE_PAYOUT_LOW_RANDOM_INCOME,
+                    "payout_if_high_random_income": spec.INSURANCE_PAYOUT_HIGH_RANDOM_INCOME,
+                    "announcement": (
+                        "From this period you may purchase insurance before the income shock. "
+                        "You can decide only in this period; your choice will be replicated "
+                        "automatically in later periods. Income allocation is independent "
+                        "of this choice. Both partners choose separately without seeing "
+                        "the other's choice; choices are shown after both are submitted."
+                    ),
+                },
+                "history": self._participant_history(pair_id),
+            }
+
         state = self._rounds[pair_id]
         has_opportunity = state.random_income[agent_id] == spec.HIGH_RANDOM_INCOME
         submitted = agent_id in state.transfer_amount
         max_transfer = state.income_before_transfer[agent_id] if has_opportunity else None
-        return {
+        observation = {
             "current_period": self.current_period,
             "stage": self.stage.value,
             "task": "transfer" if has_opportunity and not submitted else "waiting",
@@ -526,6 +749,89 @@ class RiskSharingEnv(EnvBase):
             },
             "history": self._participant_history(pair_id),
         }
+        if (
+            self.treatment is not spec.Treatment.BASELINE
+            and self.current_period >= spec.INSURANCE_OPPORTUNITY_REVEALED_PERIOD
+        ):
+            observation.update(self._insurance_account(agent_id, state.random_income[agent_id]))
+            observation["partner"].update(
+                self._insurance_account(partner_id, state.random_income[partner_id])
+            )
+            if self.treatment is spec.Treatment.FORCED_INSURANCE_25:
+                observation["insurance_assignment_source"] = "computer_random"
+                if self.current_period <= spec.INSURANCE_ACTIVE_END_PERIOD:
+                    observation["insurance_terms"] = {
+                        "cost_per_period": spec.INSURANCE_COST,
+                        "payout_if_low_random_income": spec.INSURANCE_PAYOUT_LOW_RANDOM_INCOME,
+                        "payout_if_high_random_income": spec.INSURANCE_PAYOUT_HIGH_RANDOM_INCOME,
+                    }
+                    observation["announcement"] = (
+                        "Insurance status for you and your partner was assigned randomly "
+                        "by the computer before the income draw in period 16. Neither "
+                        "participant chose this status or can change it. The assignment "
+                        "continues automatically in subsequent periods. Each insured "
+                        "participant pays 25 per period and receives 50 if their random "
+                        "income is 0, and no payout if it is 200. The computer assignment "
+                        "does not change income allocation or who can make a transfer."
+                    )
+            if self.current_period == spec.INSURANCE_REMOVAL_REVEALED_PERIOD:
+                observation["announcement"] = (
+                    "Insurance is no longer available from this period. No premium is "
+                    "charged and no insurance payment is made. Income allocation and "
+                    "transfers continue as before the option was introduced."
+                )
+        return observation
+
+    def _validate_expected_decision(self, decision_type: str, decision_id: str, value: int | bool) -> None:
+        expected = self._expected_participant_decision.get()
+        if self._participant_request_requires_decision.get() and expected is None:
+            raise PermissionError(
+                "An environment request cannot create an economic decision without a participant model envelope."
+            )
+        if expected is not None and (
+            (decision_type, decision_id, value) != expected or type(value) is not type(expected[2])
+        ):
+            raise PermissionError(
+                "The environment adapter may only forward the exact decision emitted by the participant model."
+            )
+
+    @tool(
+        readonly=False,
+        name="submit_insurance_decision",
+        description="Submit the caller's current one-time choice with purchase=true or purchase=false.",
+    )
+    async def submit_insurance_decision(
+        self, agent_id: int, decision_id: str, decision_type: str, purchase: bool,
+    ) -> dict[str, Any]:
+        """Save a sealed choice; never allocate income, settle, or advance."""
+
+        agent_id = self._validate_agent(agent_id)
+        if not isinstance(decision_id, str) or not isinstance(decision_type, str):
+            raise ValueError("decision_id and decision_type must be strings.")
+        if type(purchase) is not bool:
+            raise ValueError("purchase must be a strict boolean.")
+        self._validate_expected_decision(decision_type, decision_id, purchase)
+        receipt = self._decision_receipts.get(decision_id)
+        expected = (agent_id, self.current_period, decision_type, purchase)
+        if receipt is not None:
+            if receipt[1] != self.current_period:
+                raise ValueError("This decision_id belongs to a previous period and is stale.")
+            if receipt != expected or type(receipt[3]) is not bool:
+                raise ValueError("This decision_id is already locked to a different decision.")
+            return {"status": "already_recorded", "decision_id": decision_id,
+                    "period": self.current_period, "purchase": purchase}
+        if self.stage is not Stage.INSURANCE_DECISION or self.finished:
+            raise ValueError("This decision is not available in the current task.")
+        if decision_type != "insurance":
+            raise ValueError("decision_type does not match the current task.")
+        if decision_id != self._decision_id(self.pair_by_agent[agent_id], agent_id, "insurance"):
+            raise ValueError("decision_id is not the current valid decision for this participant.")
+        if agent_id in self._insurance_choices:
+            raise ValueError("The submitted choice is already locked.")
+        self._insurance_choices[agent_id] = purchase
+        self._decision_receipts[decision_id] = expected
+        return {"status": "submitted", "decision_id": decision_id,
+                "period": self.current_period, "purchase": purchase}
 
     @tool(
         readonly=False,
@@ -551,15 +857,7 @@ class RiskSharingEnv(EnvBase):
             raise ValueError("decision_type must be a string.")
         if type(amount) is not int:
             raise ValueError("Transfer amount must be a non-negative integer.")
-        expected = self._expected_participant_decision.get()
-        if self._participant_request_requires_decision.get() and expected is None:
-            raise PermissionError(
-                "An environment request cannot create an economic decision without a participant model envelope."
-            )
-        if expected is not None and (decision_type, decision_id, amount) != expected:
-            raise PermissionError(
-                "The environment adapter may only forward the exact decision emitted by the participant model."
-            )
+        self._validate_expected_decision(decision_type, decision_id, amount)
         receipt = self._decision_receipts.get(decision_id)
         if receipt is not None:
             recorded_agent, period, recorded_type, recorded_amount = receipt
@@ -567,7 +865,8 @@ class RiskSharingEnv(EnvBase):
                 raise ValueError("This decision_id belongs to a previous period and is stale.")
             if (
                 recorded_agent == agent_id
-                and recorded_type == decision_type
+                and recorded_type == decision_type == "transfer"
+                and type(recorded_amount) is int
                 and recorded_amount == amount
             ):
                 return {
@@ -624,6 +923,8 @@ class RiskSharingEnv(EnvBase):
         }
 
     def _all_required_decisions_submitted(self) -> bool:
+        if self.stage is Stage.INSURANCE_DECISION:
+            return len(self._insurance_choices) == len(self.participants)
         return all(bool(state.transfer_amount) for state in self._rounds.values())
 
     async def init(self, start_datetime: datetime) -> None:
@@ -638,11 +939,17 @@ class RiskSharingEnv(EnvBase):
         if self.finished or not self._all_required_decisions_submitted():
             return
 
+        if self.stage is Stage.INSURANCE_DECISION:
+            # A scheduler boundary within period 16, not a settled paper round.
+            self._prepare_period()
+            return
+
         self._settle_current_period()
         ended = self._sample_ending_after_settlement()
         if ended:
             self.finished = True
             self.stage = Stage.FINISHED
+            self._publish_stage_tools()
             return
 
         self.current_period += 1
@@ -652,6 +959,16 @@ class RiskSharingEnv(EnvBase):
 
 class RiskSharingReActRouter(ReActRouter):
     """Use the real Router tool loop, returning tool data without a summary LLM."""
+
+    async def ask(self, *args, **kwargs):
+        # 2.9.0 caches schemas at construction. Refresh this project Router's
+        # cache at the trusted call boundary, without modifying the platform.
+        self._all_tools = []
+        self._all_readonly_tools = []
+        self._tool_name_to_module = {}
+        self._tool_name_to_tool_obj = {}
+        self._collect_all_tools()
+        return await super().ask(*args, **kwargs)
 
     async def generate_final_answer(
         self, ctx, instruction, results, process_text="", status="success", error=None
@@ -693,7 +1010,7 @@ class RiskSharingRouterAdapter:
                 "raw_request": instruction,
                 "participant_variables": {
                     name: copy.deepcopy(value) for name, value in (variables or {}).items()
-                    if name in {"decision_type", "decision_id", "amount"}
+                    if name in {"decision_type", "decision_id", "amount", "purchase"}
                 },
                 "error": error,
                 "router_action": "not_forwarded",
@@ -788,29 +1105,35 @@ class RiskSharingRouterAdapter:
                 # Tool execution rejects altered, omitted or fabricated values.
                 decision_type = participant_decision["decision_type"]
                 decision_id = participant_decision["decision_id"]
-                amount = participant_decision["amount"]
+                value_field = "purchase" if decision_type == "insurance" else "amount"
+                value = participant_decision[value_field]
+                tool_name = "submit_insurance_decision" if decision_type == "insurance" else "submit_decision"
+                available = {tool["function"]["name"] for tool in self._environment._llm_tools}
+                if tool_name not in available:
+                    raise ValueError("This decision is not available in the current task.")
                 with self._environment.participant_request_requires_decision():
                     with self._environment.expected_participant_decision(
-                        decision_type, decision_id, amount
+                        decision_type, decision_id, value
                     ):
                         receipt = await self._route(
-                            ctx, "submit_decision",
+                            ctx, tool_name,
                             {"agent_id": caller_id, "decision_type": decision_type,
-                             "decision_id": decision_id, "amount": amount},
+                             "decision_id": decision_id, value_field: value},
                             readonly=False, instruction=instruction,
                             template_mode=template_mode, trace_id=trace_id,
                             parent_span_id=parent_span_id,
                         )
-                expected = (caller_id, self._environment.current_period, decision_type, amount)
+                expected = (caller_id, self._environment.current_period, decision_type, value)
                 if self._environment._decision_receipts.get(decision_id) != expected:
                     raise RuntimeError("Router did not save the participant's exact decision.")
                 if (
                     receipt.get("decision_id") != decision_id
-                    or receipt.get("amount") != amount
+                    or receipt.get(value_field) != value
+                    or type(receipt.get(value_field)) is not type(value)
                     or receipt.get("period") != self._environment.current_period
                 ):
                     raise RuntimeError("Router returned a receipt inconsistent with the environment.")
-                return self._result_pair("submit_decision", receipt)
+                return self._result_pair(tool_name, receipt)
 
             if self._is_observation_request(instruction):
                 # A fixed readonly request needs identity binding, not an LLM.

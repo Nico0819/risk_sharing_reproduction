@@ -1,0 +1,13 @@
+{
+  "renderer": "custom/agents/observation_presentation.py",
+  "old_renderer_module_removed": true,
+  "sha256": {
+    "custom/agents/observation_presentation.py": "cc99d958b687a4ce435814e87e0bb07dc16869241514d58858104b91c8728058",
+    "custom/agents/risk_sharing_participant.py": "c7a530cc99ebc8ab2fdb05a795674d493e697cd54954b165e1f3413135b9dfb0",
+    "custom/agents/fixed_preferences_v1/participant.py": "c0b2e2490bf00984f37dff1a693cf3510d204f9ced5ec7cc58f7e1e42203c4fc",
+    "experiments/baseline/run_smoke.py": "5b664f467144a4a6adcbde98a5d2b0f7bb4ee192afd42053adaca548aade7043",
+    "experiments/fixed_preferences_v1/run_smoke.py": "b3ec3efef51077910e0b8bc3f6a3f3223ab8a15e6744d20295a67b704da1a808",
+    "custom/envs/risk_sharing_env.py": "a28ed5274c039515a781e6dc4bb63138a7e5af195db96c2bf77dfaa14ddaac86",
+    "protocol/paper_spec.py": "11e0f3b2be99815b082109d19830b5b7e45c469dffd27f788bdc3f9c4c6cb718"
+  }
+}

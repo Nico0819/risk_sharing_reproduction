@@ -1,0 +1,116 @@
+{
+  "source": {
+    "title": "Formal insurance and informal risk sharing dynamics",
+    "authors": [
+      "Wanchuan Lin",
+      "Juanjuan Meng",
+      "Xi Weng"
+    ],
+    "journal_year": 2020,
+    "doi": "10.1016/j.jebo.2019.04.016",
+    "local_pdf": "../../papers/1-s2.0-S0167268119301192-main.pdf"
+  },
+  "status": "Published aggregate values transcribed from local PDF; not simulation output or participant-level data.",
+  "phases": [
+    "1–15",
+    "16–30",
+    "31–45"
+  ],
+  "table_2": [
+    {
+      "treatment": "Baseline",
+      "subjects": 32,
+      "mean": [
+        64,
+        59,
+        52
+      ],
+      "sd": [
+        35,
+        41,
+        42
+      ]
+    },
+    {
+      "treatment": "25V",
+      "subjects": 36,
+      "mean": [
+        65,
+        48,
+        59
+      ],
+      "sd": [
+        44,
+        39,
+        43
+      ]
+    },
+    {
+      "treatment": "25F",
+      "subjects": 40,
+      "mean": [
+        78,
+        60,
+        72
+      ],
+      "sd": [
+        34,
+        36,
+        39
+      ]
+    }
+  ],
+  "did_vs_baseline": [
+    {
+      "treatment": "25V",
+      "group": "overall",
+      "phase2": -11.06,
+      "phase2_significance": "p<0.01",
+      "phase3": 6.3,
+      "phase3_significance": "p<0.05",
+      "table": 3
+    },
+    {
+      "treatment": "25V",
+      "group": "both_insured",
+      "phase2": -20.01,
+      "phase2_significance": "p<0.01",
+      "phase3": 0.85,
+      "phase3_significance": "not significant at 10%",
+      "table": 3
+    },
+    {
+      "treatment": "25V",
+      "group": "insured_with_uninsured_partner",
+      "phase2": -4.7,
+      "phase2_significance": "not significant at 10%",
+      "phase3": 11.31,
+      "phase3_significance": "p<0.05",
+      "table": 3
+    },
+    {
+      "treatment": "25V",
+      "group": "uninsured_with_insured_partner",
+      "phase2": -2.05,
+      "phase2_significance": "not significant at 10%",
+      "phase3": 11.53,
+      "phase3_significance": "p<0.05",
+      "table": 3
+    },
+    {
+      "treatment": "25F",
+      "group": "overall",
+      "phase2": -15.58,
+      "phase2_significance": "p<0.01",
+      "phase3": 1.89,
+      "phase3_significance": "not significant at 10%",
+      "table": 5
+    }
+  ],
+  "caveats": [
+    "Plot uses Table 2 means verbatim, not values digitized from Figure 1. Error bars omitted; SDs remain in this JSON.",
+    "25F insurance shares in Tables 2 and 5 are inconsistent if interpreted as the same sample. Its Table 5 observation count also requires original-data clarification. Do not infer assignment probabilities from these figures.",
+    "DID coefficients are copied from regressions, not computed from the rounded Table 2 means.",
+    "Footnote 10, p.842: some asymmetric-case estimates have wild-cluster-bootstrap p-values 0.10–0.13. Main-table stars do not capture this sensitivity."
+  ]
+}

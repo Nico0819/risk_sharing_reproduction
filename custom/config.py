@@ -1,14 +1,16 @@
 """Project-local configuration loading with secret-safe LLM mapping.
 
 The loader reads the project-root ``.env`` explicitly and never prints its
-contents.  It maps the three project variables to the names consumed by the
-installed AgentSociety2 dispatcher before importing that dispatcher.
+contents. Project ``LLM_*`` values are authoritative; the ``AGENTSOCIETY_*``
+connection variables are derived aliases for this process, not a second
+configuration source. Mapping happens before importing the dispatcher.
 """
 
 from __future__ import annotations
 
 import os
 import shlex
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -102,27 +104,23 @@ def _resolved_value(name: str, dotenv: Mapping[str, str]) -> str:
     return str(dotenv.get(name, "")).strip()
 
 
-def _set_consistent(name: str, value: str) -> None:
-    """Set a framework alias unless an existing process value conflicts."""
-
-    existing = os.environ.get(name)
-    if existing is not None and existing.strip() and existing.strip() != value:
-        raise RuntimeConfigError(f"conflicting existing runtime setting: {name}")
-    os.environ.setdefault(name, value)
-
-
 def _apply_framework_settings(*, api_key: str, base_url: str, model: str) -> None:
-    """Map one external LLM configuration to both AgentSociety2 LLM roles."""
+    """Map validated project settings to both roles, replacing stale aliases.
 
-    for name, value in (
-        ("AGENTSOCIETY_LLM_API_KEY", api_key),
-        ("AGENTSOCIETY_LLM_API_BASE", base_url),
-        ("AGENTSOCIETY_LLM_MODEL", model),
-        ("AGENTSOCIETY_CODER_LLM_API_KEY", api_key),
-        ("AGENTSOCIETY_CODER_LLM_API_BASE", base_url),
-        ("AGENTSOCIETY_CODER_LLM_MODEL", model),
-    ):
-        _set_consistent(name, value)
+    A shell or an earlier scripted run can leave unrelated framework values
+    behind. They must not override the explicitly selected project backend.
+    Validate all remaining constraints before changing any environment value.
+    Only this process is changed; the dotenv file and parent shell are untouched.
+    """
+
+    settings = {
+        "AGENTSOCIETY_LLM_API_KEY": api_key,
+        "AGENTSOCIETY_LLM_API_BASE": base_url,
+        "AGENTSOCIETY_LLM_MODEL": model,
+        "AGENTSOCIETY_CODER_LLM_API_KEY": api_key,
+        "AGENTSOCIETY_CODER_LLM_API_BASE": base_url,
+        "AGENTSOCIETY_CODER_LLM_MODEL": model,
+    }
 
     # Keep reasoning disabled for the experiment unless the framework setting
     # is already an explicit disabled value.
@@ -130,13 +128,28 @@ def _apply_framework_settings(*, api_key: str, base_url: str, model: str) -> Non
         existing = os.environ.get(name, "").strip().lower()
         if existing and existing not in {"off", "0", "false", "disable", "disabled", "no"}:
             raise RuntimeConfigError(f"thinking must be disabled before real backend: {name}")
-        os.environ.setdefault(name, "off")
+        settings[name] = "off"
     disabled_body = '{"thinking":{"type":"disabled"}}'
     for name in ("AGENTSOCIETY_LLM_EXTRA_BODY", "AGENTSOCIETY_CODER_LLM_EXTRA_BODY"):
         existing = os.environ.get(name, "").strip()
         if existing and existing != disabled_body:
             raise RuntimeConfigError(f"conflicting thinking payload: {name}")
-        os.environ.setdefault(name, disabled_body)
+        settings[name] = disabled_body
+
+    os.environ.update(settings)
+
+    # Config snapshots connection fields at import time. A fresh CLI imports
+    # it later, while notebooks/tests may have already used the framework.
+    # Update only its connection fields so newly constructed clients agree
+    # with this configuration, without importing/reloading the framework or
+    # changing clients already owned by another running experiment.
+    module = sys.modules.get("agentsociety2.config.config")
+    framework_config = getattr(module, "Config", None)
+    if framework_config is not None:
+        for role in ("LLM", "CODER_LLM"):
+            for suffix in ("API_KEY", "API_BASE", "MODEL"):
+                attribute = f"{role}_{suffix}"
+                setattr(framework_config, attribute, settings[f"AGENTSOCIETY_{attribute}"])
 
 
 def _apply_scripted_framework_settings() -> None:

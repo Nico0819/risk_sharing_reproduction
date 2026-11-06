@@ -1,0 +1,59 @@
+{
+  "source_run": "experiments/fixed_preferences_memory_v1/runs/baseline/20261026T121103Z-6255a6c3",
+  "failures": [
+    {
+      "agent_id": 1,
+      "period": 8,
+      "request_index": 352,
+      "previous_revision": 7,
+      "content_fields": [
+        "evidence_periods",
+        "expected_partner_transfer",
+        "last_reviewed_period",
+        "last_reviewed_task",
+        "partner_assessment",
+        "partner_id",
+        "perceived_partner_expectation",
+        "uncertainties"
+      ],
+      "evidence_period_count": 4,
+      "validation_error": "Private memory must contain only the specified belief and evidence fields",
+      "raw_output_sha256": "b65e5e6a6b22b3c12960892f7310097e03c7aa78fa676e422efe80cb83864e9f"
+    },
+    {
+      "agent_id": 11,
+      "period": 8,
+      "request_index": 362,
+      "previous_revision": 7,
+      "content_fields": [
+        "evidence_periods",
+        "expected_partner_transfer",
+        "partner_assessment",
+        "perceived_partner_expectation",
+        "uncertainties"
+      ],
+      "evidence_period_count": 7,
+      "validation_error": "Evidence must be at most six distinct settled period numbers",
+      "raw_output_sha256": "470fdec444605ba410a4e530ac96bd95e1a1a964e128e9dc75fb95ed7e1f178d"
+    },
+    {
+      "agent_id": 10,
+      "period": 8,
+      "request_index": 361,
+      "previous_revision": 7,
+      "content_fields": [
+        "evidence_periods",
+        "expected_partner_transfer",
+        "partner_assessment",
+        "perceived_partner_expectation",
+        "uncertainties"
+      ],
+      "evidence_period_count": 7,
+      "validation_error": "Evidence must be at most six distinct settled period numbers",
+      "raw_output_sha256": "7a5bf27531d57c17b23fcc3ba70d744bc0e5156397a56dd960deb967e67565cb"
+    }
+  ],
+  "strict_validation_unchanged": true,
+  "original_run_files_unchanged": 70,
+  "external_api_calls": 0
+}
