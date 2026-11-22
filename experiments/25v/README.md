@@ -139,7 +139,7 @@ Python 普通 `from` 语句不能使用数字开头的包名，测试通过 `imp
 cd /home/zhicheng/risk_sharing_reproduction
 .venv/bin/python -m experiments.25v.run_smoke \
   --backend llm --participants 20 --full-session --seed 2026 \
-  --request-limit 20000 --max-output-tokens 2048 \
+  --request-limit 20000 --max-output-tokens 8192 \
   --router-max-steps 4 --agent-max-turns 4 \
   --agent-concurrency 20 \
   --timeout-seconds 86400 --request-timeout 120

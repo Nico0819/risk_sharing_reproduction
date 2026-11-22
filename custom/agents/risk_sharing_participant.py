@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,9 @@ from agentsociety2.agent import PersonAgent
 from agentsociety2.agent.base.react import ReactToolResult
 
 from custom.agents.observation_presentation import render_readable_turn
+from custom.agents.reasoning_trace import (
+    first_response_message, message_value, provider_reasoning_fields,
+)
 from custom.envs.risk_sharing_env import parse_participant_decision
 
 
@@ -65,6 +70,42 @@ class RiskSharingParticipant(PersonAgent):
         """Describe our explicit-choice protocol instead of generic templates."""
 
         overrides = super()._react_tool_overrides(readonly=readonly)
+        if not readonly:
+            # Keep PersonAgent's actual nonempty-memories finish contract,
+            # but describe its role in this experiment. The framework's
+            # generic extraction/consolidation instructions contradict our
+            # separately managed private notes and caused needless reflection.
+            finish = copy.deepcopy(overrides["finish"])
+            function = finish["function"]
+            private_note = self._config.get("private_memory_enabled", False)
+            function["description"] = (
+                "End your current turn when the observation task is waiting or finished. "
+                "Provide at least one brief observation in memories to satisfy the "
+                "framework's finish protocol. If the current task requires a choice, "
+                "submit it through ask_env first; after a verified receipt, the program "
+                "ends your turn automatically."
+            )
+            if private_note:
+                function["description"] += (
+                    " Your experiment private note is managed in a separate memory-update "
+                    "phase; this finish payload does not write or replace it."
+                )
+            memories = function["parameters"]["properties"]["memories"]
+            memories["description"] = (
+                "At least one brief observation from this turn, required to finish. "
+                "This is a framework completion payload."
+            )
+            if private_note:
+                memories["description"] += " It does not update your experiment private note."
+            fields = memories["items"]["properties"]
+            fields["type"]["description"] = (
+                "Episode category; use observation for a factual task observation."
+            )
+            fields["importance"]["description"] = (
+                "Relative importance of this brief episode, from 0 to 1."
+            )
+            fields["text"]["description"] = "One brief factual observation from your current task."
+            overrides["finish"] = finish
         overrides["ask_env"] = {
             "type": "function",
             "function": {
@@ -94,6 +135,32 @@ class RiskSharingParticipant(PersonAgent):
             },
         }
         return overrides
+
+    def _parse_react_turn(self, response, *, readonly: bool = False):
+        """Keep provider reasoning in this participant's tool continuation.
+
+        AgentSociety2 rebuilds assistant messages from parsed tool decisions,
+        dropping extra provider fields and shortening content. Retain its real
+        parsing/validation and tool-id handling, then restore the response's
+        reasoning alongside the original content. These fields stay in the
+        participant conversation; they are never environment tool arguments.
+        """
+
+        turn = super()._parse_react_turn(response, readonly=readonly)
+        reply = first_response_message(response)
+        reasoning = provider_reasoning_fields(reply)
+        if not reasoning:
+            return turn
+        message = dict(turn.assistant_message or {"role": "assistant"})
+        message["content"] = message_value(reply, "content")
+        message.update(reasoning)
+        error = turn.error
+        if turn.assistant_message is None and not turn.decisions and not error:
+            # A reasoning-only response must not disappear before the next
+            # request. The framework's normal correction path appends it and
+            # asks the same participant to supply an actual permitted action.
+            error = "No valid tool call was produced. Use a permitted action tool."
+        return replace(turn, assistant_message=message, error=error)
 
     async def _complete_react_once(self, messages, *, readonly: bool = False):
         """End a verified submission locally when subjective memory is disabled.
@@ -161,7 +228,7 @@ class RiskSharingParticipant(PersonAgent):
             recorder(observation=observation, messages=review_messages, review_text=summary)
         messages.extend([
             review_request,
-            {"role": "assistant", "content": summary},
+            {"role": "assistant", "content": summary, **provider_reasoning_fields(reply)},
             {
                 "role": "user",
                 "content": (

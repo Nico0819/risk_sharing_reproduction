@@ -150,7 +150,7 @@ cd /home/zhicheng/risk_sharing_reproduction
     "${INSURANCE_PROB_FIRST:?请先设置仅第一位获保概率}" \
     "${INSURANCE_PROB_SECOND:?请先设置仅第二位获保概率}" \
   --assignment-seed 2026 \
-  --request-limit 20000 --max-output-tokens 2048 \
+  --request-limit 20000 --max-output-tokens 8192 \
   --router-max-steps 4 --agent-max-turns 4 \
   --agent-concurrency 20 \
   --timeout-seconds 86400 --request-timeout 120

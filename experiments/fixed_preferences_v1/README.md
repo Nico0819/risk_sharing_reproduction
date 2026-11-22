@@ -31,6 +31,8 @@
 
 私人记忆保持关闭，`enable_memory=False`。客观的本 pair 历史仍由环境提供。与基准相比，偏好注入本身不增加额外模型请求，但会增加输入文本和本地日志。Router 沿用当前项目的行为：`llm` 模式会调用 Router 模型，它只能转发已明确提交的经济变量；`scripted` 模式不调用外部模型。
 
+当前代码已统一开启参与者原生推理，Router 的原生推理关闭。`participant_reasoning.jsonl` 保存接口实际提供的推理字段、最终输出和完成状态；缺失或截断会明确标记。单次输出默认 8192 token，包含推理与最终行动。此设置已直接更新现有入口，不需要增加开关；旧实验文件保持原样。查看方法和边界见[推理轨迹说明](../fixed_preferences_memory_v1/README.md#查看推理轨迹)。
+
 偏好配置只自动注入本人的 participant 输入，其他参与者无法读取该配置。Router 沿用原有的请求转发路径，会收到参与者提交的原文理由；如果参与者在理由中主动提到自己的偏好，Router 可能看到这些文字，但不能据此修改金额。程序不会把全员偏好配置交给 Router。
 
 新提示词明确要求参与者希望提高自己的最终收益，同时按个人偏好权衡收益的不确定性和自己收入高于搭档的程度。参与者自行决定是否愿意、以及愿意放弃多少自身收益来降低风险或缩小优势收入差距。支付方式和环境规则没有改变。原版与新版的差异同时包括目标措辞和个人配置，不能仅凭两个版本的结果差异识别某一个偏好的作用。
@@ -149,7 +151,7 @@ env -u AGENTSOCIETY_LLM_API_KEY \
   --treatment baseline --backend llm \
   --participants 20 --agent-concurrency 20 --full-session \
   --seed 2026 --preference-seed 2026 \
-  --request-limit 20000 --max-output-tokens 2048 \
+  --request-limit 20000 --max-output-tokens 8192 \
   --router-max-steps 4 --agent-max-turns 4 \
   --timeout-seconds 86400 --request-timeout 120
 ```
@@ -165,10 +167,11 @@ env -u AGENTSOCIETY_LLM_API_KEY \
 | `summary.md`、`report.html` | 本次运行概况及沿用项目报告模块生成的图表 |
 | `participant_profiles.json` | 全员配置，可直接复用为输入文件；供研究者审阅，不作为全员上下文传给参与者 |
 | `participant_contexts.jsonl` | 实际交给 participant client 的模型消息、本人偏好和配置指纹，可按 Agent、轮次和 decision ID 核对 |
+| `participant_reasoning.jsonl` | 同次调用的接口推理、最终输出、工具参数及完成状态 |
 | `agent_actions.jsonl` | 参与者原始选择、Router 动作、环境 receipt，以及关联的个人偏好指纹 |
 | `agents/agent_XXXX/config.json` | 该 Agent 的固定配置；每轮恢复后继续使用 |
 | `manifest.json` | 实验及呈现版本、运行参数、配置来源、配置文件和源代码指纹、请求次数及结果 |
-| `baseline_reference.json` | 新版本创建时原项目相关文件的指纹，便于核对基准 |
+| `baseline_reference.json` | 此版本创建时的历史文件指纹；当前源文件以 manifest 的本次运行指纹为准 |
 | `period_records.jsonl` | 环境已经结算的逐人逐轮数据 |
 
 25V、25F 继续分别保存保险选择或保险分配记录。完整 session 继续保存支付轮次和支付记录；这些记录不是外部付款操作。

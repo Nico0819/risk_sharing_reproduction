@@ -665,6 +665,28 @@ class RiskSharingEnv(EnvBase):
             for record in self.pair_history[pair_id]
         ]
 
+    async def get_settled_feedback(self, agent_id: int) -> dict[str, Any]:
+        """Return only already-settled private facts for a final memory update.
+
+        This is deliberately not advertised as a model-selectable tool. The
+        trusted adapter selects it during closing. In a bounded smoke run the
+        environment has already prepared the next round, whose insurance offer,
+        income draw or withdrawal announcement must not enter this feedback.
+        """
+
+        agent_id = self._validate_agent(agent_id)
+        history = self._participant_history(self.pair_by_agent[agent_id])
+        last_settled_period = max((record["period"] for record in history), default=0)
+        return {
+            "current_period": last_settled_period,
+            "last_settled_period": last_settled_period,
+            "stage": "closing",
+            "task": "closing",
+            "agent_id": agent_id,
+            "partner_id": self.partner_by_agent[agent_id],
+            "history": history,
+        }
+
     @tool(
         readonly=True,
         name="get_observation",
@@ -987,6 +1009,16 @@ class RiskSharingRouterAdapter:
     def __init__(self, router: Any, environment: RiskSharingEnv) -> None:
         self._router = router
         self._environment = environment
+        self._closing_feedback = False
+
+    def begin_closing_feedback(self) -> None:
+        """Switch this participant service to settled feedback only.
+
+        The experiment scheduler invokes this after economic actions stop.
+        PersonAgent still supplies its own real identity through ask_env.
+        """
+
+        self._closing_feedback = True
 
     @property
     def participant_decisions(self) -> list[dict[str, Any]]:
@@ -1096,6 +1128,13 @@ class RiskSharingRouterAdapter:
 
         participant_decision = parse_participant_decision(instruction, ctx.get("variables"))
         with self._environment.caller_context(caller_id):
+            if self._closing_feedback:
+                if not readonly or not self._is_observation_request(instruction) or participant_decision is not None:
+                    raise PermissionError("Closing feedback permits only the fixed readonly observation request.")
+                observation = await self._environment.get_settled_feedback(agent_id=caller_id)
+                if observation.get("agent_id") != caller_id:
+                    raise PermissionError("Closing feedback belongs to another participant.")
+                return self._result_pair("get_observation", observation)
             if participant_decision is not None:
                 if readonly:
                     raise PermissionError(

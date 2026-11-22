@@ -59,6 +59,31 @@ amount: <参与者选择的整数>
 
 当前虚拟环境实际安装的是 **`agentsociety2==2.9.0`**，项目声明和 `uv.lock` 也已固定为这个版本。
 
+## 九种人格的配对批量实验
+
+固定偏好与私人记忆版本增加了一个[批量运行入口](experiments/preference_grid/README.md)：两维偏好各取低、中、高，形成九种人格，按第一位 × 第二位保留 81 种配对。默认每种配对在 Baseline、25V、25F 中各重复 10 次，共 2,430 场独立两人实验。每次重新创建 Agent 和记忆，研究侧 CSV 明确记录双方人格、实际 Agent ID、组合与重复编号；结果还可按 9 × 9 矩阵查看。生成计划不会调用模型，开始运行需要单独执行 `run`。
+
+## 参与者推理记录
+
+当前代码直接启用了参与者模型的原生推理，没有另建实验版本。三个 treatment，以及原版、固定偏好、固定偏好与私人记忆三个入口，都使用这一设置。`llm` 模式向参与者接口发送 `thinking.type=enabled`，向 Router 发送 `thinking.type=disabled`；模型、地址和密钥继续来自现有配置。Router 仍只转发参与者已经选好的经济变量。
+
+每次参与者调用返回后，`participant_reasoning.jsonl` 保存接口实际暴露的推理字段、最终输出、工具参数和完成状态。记录包含 Agent、轮次、任务和请求序号，可以与 `participant_contexts.jsonl` 的输入、`agent_actions.jsonl` 的环境回执对应。私人记忆版另外区分 `memory_update` 和 `decision`；可选的额外评估标为 `deliberation`。
+
+例如查看 Agent 1 在第 16 轮的决策记录：
+
+```bash
+.venv/bin/python -m experiments.view_reasoning <运行目录> \
+  --agent-id 1 --period 16 --phase decision
+```
+
+实验结束后会自动在运行目录的 `reasoning_text/` 下生成推理正文汇总 `all_agents.txt` 和每个 Agent 的独立 `.txt` 文件，`summary.md` 中有打开链接。正常结束、Agent 报错和程序处理的超时退出都会导出已经保存的调用，不增加模型请求。若进程被强制杀死而未执行收尾，或要处理旧运行，可运行 `.venv/bin/python -m experiments.export_reasoning <运行目录>` 手动导出。
+
+默认单次输出上限改为 8192 token，给推理和最终行动留出空间；显式传入较小的 `--max-output-tokens` 仍会生效。原生推理与 `--participant-deliberation` 是两回事，前者已开启，后者仍默认关闭，会额外增加一次模型调用。
+
+这里保存的是接口提供的推理文本，不能当作模型全部内部计算的记录，也不能保证解释就是行为的真实原因。接口没返回、输出被截断、请求失败或日志脱敏时会分别标记，程序不会补写推理。记录边界是一次框架客户端调用的最终返回，框架内部的网络重试不逐次记录。旧实验无法补回当时没有保存的推理；`scripted` 输出会明确标记为离线模拟。说明和字段详见[私人记忆版运行文档](experiments/fixed_preferences_memory_v1/README.md#查看推理轨迹)。
+
+本次工程验证包括完整回归、真实 SDK 的离线请求拦截，以及三类各 20 人的完整 scripted 实验，命令和结果见 [2026-11-09 验证记录](artifacts/reasoning_trace_20261109/VALIDATION.md)。未调用真实模型 API 验证本次改动。
+
 ## 目录说明
 
 ```text
@@ -157,6 +182,7 @@ observation 或经济决定混在一起。全局 `--request-limit` 对参与者�
 
 - `manifest.json`：运行参数、信息呈现版本和最终状态；
 - `agent_actions.jsonl`：每次环境工具调用，以及 participant、适配器、环境三方的记录；
+- `participant_contexts.jsonl`、`participant_reasoning.jsonl`：参与者模型的实际输入、接口暴露的推理和最终输出，通过 Agent 与请求序号关联；
 - `period_records.jsonl`：环境结算后的数据；
 - `summary.md`：摘要，顶部提供交互图表入口；
 - `report.html`：Baseline、25V、25F 每次运行自动生成的离线交互报告，可按轮次范围比较各组的转账、收入差和转账频率，支持多选、热图、排序和 CSV 导出，也可查看单组轨迹；25V 展示购买选择，25F 展示电脑原始分配，两者均汇总保费和赔付；
@@ -199,3 +225,6 @@ cd /home/zhicheng/risk_sharing_reproduction
 支付部分目前只生成随机选中的轮次及对应收益记录，尚未接入实际支付系统。
 
 论文规则统一记录在 [`protocol/paper_spec.py`](protocol/paper_spec.py) 中，保持冻结。运行说明见 [Baseline](experiments/baseline/README.md)、[25V](experiments/25v/README.md) 和 [25F](experiments/25f/README.md)。
+
+
+私人记忆入口现使用自由短笔记（schema 2），按新的合法反馈更新，并在实验结束后补记最后一轮。新运行自动生成 `memory_text/agent_XXXX.txt`，可以直接阅读每个人的笔记变化及关联决定。`--memory-condition persistent` 为默认持久记忆，`fresh` 为不读取旧笔记的当轮反思对照。旧运行产物不迁移；具体流程和命令见[私人记忆说明](experiments/fixed_preferences_memory_v1/README.md#查看记忆与匹配对照)。

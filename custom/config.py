@@ -3,7 +3,8 @@
 The loader reads the project-root ``.env`` explicitly and never prints its
 contents. Project ``LLM_*`` values are authoritative; the ``AGENTSOCIETY_*``
 connection variables are derived aliases for this process, not a second
-configuration source. Mapping happens before importing the dispatcher.
+configuration source. Participant reasoning is enabled; the forwarding Router
+keeps reasoning disabled. Mapping happens before importing the dispatcher.
 """
 
 from __future__ import annotations
@@ -39,7 +40,9 @@ class RuntimeConfig:
     model: str
     env_path: Path
     api_key: str = field(repr=False, default="")
-    thinking_disabled: bool = True
+    # Retained for callers which used the original participant-mode flag.
+    thinking_disabled: bool = False
+    router_thinking_disabled: bool = True
 
     @property
     def api_key_configured(self) -> bool:
@@ -54,7 +57,9 @@ class RuntimeConfig:
             "api_key": "configured" if self.api_key_configured else "not configured",
             "base_url": "configured" if bool(self.base_url.strip()) else "not configured",
             "model": self.model if _is_real_value(self.model) else "not configured",
-            "thinking": "disabled" if self.thinking_disabled else "not disabled",
+            "thinking": "disabled" if self.thinking_disabled else "enabled",
+            "participant_thinking": "disabled" if self.thinking_disabled else "enabled",
+            "router_thinking": "disabled" if self.router_thinking_disabled else "enabled",
         }
 
 
@@ -109,8 +114,10 @@ def _apply_framework_settings(*, api_key: str, base_url: str, model: str) -> Non
 
     A shell or an earlier scripted run can leave unrelated framework values
     behind. They must not override the explicitly selected project backend.
-    Validate all remaining constraints before changing any environment value.
-    Only this process is changed; the dotenv file and parent shell are untouched.
+    Connection credentials have already been validated. Role-specific thinking
+    aliases are also project-owned: an old disabled participant setting must not
+    silently turn reasoning off, and the Router must not inherit participant
+    reasoning. Only this process changes; the dotenv file and shell do not.
     """
 
     settings = {
@@ -120,34 +127,30 @@ def _apply_framework_settings(*, api_key: str, base_url: str, model: str) -> Non
         "AGENTSOCIETY_CODER_LLM_API_KEY": api_key,
         "AGENTSOCIETY_CODER_LLM_API_BASE": base_url,
         "AGENTSOCIETY_CODER_LLM_MODEL": model,
+        "AGENTSOCIETY_LLM_THINKING": "on",
+        "AGENTSOCIETY_LLM_EXTRA_BODY": '{"thinking":{"type":"enabled"}}',
+        "AGENTSOCIETY_CODER_LLM_THINKING": "off",
+        "AGENTSOCIETY_CODER_LLM_EXTRA_BODY": '{"thinking":{"type":"disabled"}}',
+        # Use the provider's enabled-mode default effort. Do not inherit an
+        # unrelated previous run's effort (including a disabling value).
+        "AGENTSOCIETY_LLM_REASONING_EFFORT": "",
+        "AGENTSOCIETY_CODER_LLM_REASONING_EFFORT": "",
     }
-
-    # Keep reasoning disabled for the experiment unless the framework setting
-    # is already an explicit disabled value.
-    for name in ("AGENTSOCIETY_LLM_THINKING", "AGENTSOCIETY_CODER_LLM_THINKING"):
-        existing = os.environ.get(name, "").strip().lower()
-        if existing and existing not in {"off", "0", "false", "disable", "disabled", "no"}:
-            raise RuntimeConfigError(f"thinking must be disabled before real backend: {name}")
-        settings[name] = "off"
-    disabled_body = '{"thinking":{"type":"disabled"}}'
-    for name in ("AGENTSOCIETY_LLM_EXTRA_BODY", "AGENTSOCIETY_CODER_LLM_EXTRA_BODY"):
-        existing = os.environ.get(name, "").strip()
-        if existing and existing != disabled_body:
-            raise RuntimeConfigError(f"conflicting thinking payload: {name}")
-        settings[name] = disabled_body
 
     os.environ.update(settings)
 
-    # Config snapshots connection fields at import time. A fresh CLI imports
+    # Config snapshots fields at import time. A fresh CLI imports
     # it later, while notebooks/tests may have already used the framework.
-    # Update only its connection fields so newly constructed clients agree
-    # with this configuration, without importing/reloading the framework or
-    # changing clients already owned by another running experiment.
+    # Refresh connection fields and thinking documentation snapshots without
+    # importing/reloading the framework or changing clients already owned by
+    # another running experiment.
     module = sys.modules.get("agentsociety2.config.config")
     framework_config = getattr(module, "Config", None)
     if framework_config is not None:
         for role in ("LLM", "CODER_LLM"):
-            for suffix in ("API_KEY", "API_BASE", "MODEL"):
+            for suffix in (
+                "API_KEY", "API_BASE", "MODEL", "THINKING", "EXTRA_BODY", "REASONING_EFFORT",
+            ):
                 attribute = f"{role}_{suffix}"
                 setattr(framework_config, attribute, settings[f"AGENTSOCIETY_{attribute}"])
 
@@ -199,6 +202,7 @@ def load_runtime_config(
             model="scripted-model",
             env_path=path,
             api_key="",
+            thinking_disabled=True,
         )
 
     api_key = _resolved_value("LLM_API_KEY", dotenv)

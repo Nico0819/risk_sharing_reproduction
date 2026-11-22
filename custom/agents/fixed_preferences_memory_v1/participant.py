@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from custom.agents.fixed_preferences_v1.participant import FixedPreferenceParticipant
 from custom.agents.fixed_preferences_v1.profiles import render_profile
 from custom.agents.risk_sharing_participant import INSURANCE_PROMPT_PATH
 from .state import (
     MEMORY_UPDATE_MAX_ATTEMPTS,
-    load_state, memory_payload, observation_sha256, parse_memory_output,
+    has_new_feedback, load_state, memory_payload, parse_memory_output,
     updated_state, write_state,
 )
 
@@ -18,6 +19,7 @@ from .state import (
 PROMPT_PATH = Path(__file__).with_name("participant.md")
 MEMORY_USAGE_PATH = Path(__file__).with_name("memory_usage.md")
 MEMORY_UPDATE_PATH = Path(__file__).with_name("memory_update.md")
+MEMORY_UPDATE_PHASE_PATH = Path(__file__).with_name("memory_update_phase.md")
 
 
 class FixedPreferenceMemoryParticipant(FixedPreferenceParticipant):
@@ -27,12 +29,16 @@ class FixedPreferenceMemoryParticipant(FixedPreferenceParticipant):
     def description(cls) -> str:
         return "Risk-sharing participant with fixed preferences and private persistent beliefs."
 
-    def _memory_message(self, state):
+    def _memory_message(self, state, *, empty_note=False):
+        payload = memory_payload(state)
+        if empty_note:
+            payload["content"] = {"note": "", "evidence_periods": []}
+            payload["evidence"] = []
         return {
             "role": "user",
             "content": MEMORY_USAGE_PATH.read_text(encoding="utf-8")
             + "\n\n<private_memory>\n"
-            + json.dumps(memory_payload(state), ensure_ascii=False, sort_keys=True)
+            + json.dumps(payload, ensure_ascii=False, sort_keys=True)
             + "\n</private_memory>",
         }
 
@@ -73,13 +79,29 @@ class FixedPreferenceMemoryParticipant(FixedPreferenceParticipant):
             raise ValueError("Private memory and economic choices require a current observation")
         if self._private_memory_failed:
             raise ValueError("The private memory update failed; no economic decision is permitted")
-        if not readonly and observation.get("task") in {"transfer", "insurance", "waiting"}:
-            if self._private_memory_state["last_observation_sha256"] != observation_sha256(observation):
+        if not readonly and observation.get("task") in {"transfer", "insurance", "waiting", "closing"}:
+            if has_new_feedback(self._private_memory_state, observation):
                 try:
                     await self._update_private_memory(messages, observation)
                 except BaseException:
                     self._private_memory_failed = True
                     raise
+        if observation.get("task") == "closing":
+            # A final legal feedback pass has no economic action. Finish the
+            # real framework loop locally after the participant's own update.
+            function = SimpleNamespace(name="finish", arguments=json.dumps({
+                "final": "Final private note recorded. No further action.",
+                # PersonAgent requires a nonempty episode even when its
+                # generic memory runtime is disabled. This records only the
+                # observed completion event, not a fabricated belief/choice.
+                "memories": [{"type": "observation", "importance": 0.0,
+                              "text": "Received final settled feedback for my pair.",
+                              "source": "environment_feedback"}],
+            }))
+            call = SimpleNamespace(id=f"closing-finish-{self.id}", type="function", function=function)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="", tool_calls=[call]),
+            )])
         # Reuse the existing receipt shortcut and optional deliberation. The
         # latter, if enabled explicitly, now sees this participant's own note.
         return await super()._complete_react_once(messages, readonly=readonly)
@@ -95,7 +117,23 @@ class FixedPreferenceMemoryParticipant(FixedPreferenceParticipant):
             + instructions
             + "\n</private_memory_update>",
         }
-        update_messages = [*messages, request]
+        # The fresh-reflection control uses the identical update schedule and
+        # prompt, but never supplies yesterday's subjective note to the model.
+        update_base = list(messages)
+        # The normal system prompt requires tools for economic actions. A
+        # memory-only call has no tools and needs a different output contract;
+        # declare that phase at the same priority, without changing the facts
+        # or inserting these instructions into the later decision call.
+        update_base[0] = {
+            **messages[0],
+            "content": messages[0]["content"] + "\n\n"
+            + MEMORY_UPDATE_PHASE_PATH.read_text(encoding="utf-8"),
+        }
+        if self._config.get("memory_condition", "persistent") == "fresh":
+            update_base[self._private_memory_message_index] = self._memory_message(
+                self._private_memory_state, empty_note=True,
+            )
+        update_messages = [*update_base, request]
         previous = self._private_memory_state
         for attempt in range(1, MEMORY_UPDATE_MAX_ATTEMPTS + 1):
             # Transport errors, cancellation and exhausted budgets must not be
@@ -147,7 +185,7 @@ class FixedPreferenceMemoryParticipant(FixedPreferenceParticipant):
                     + f"Attempt {attempt + 1} of {MEMORY_UPDATE_MAX_ATTEMPTS}.\n"
                     + feedback + "\n</private_memory_update>",
                 }
-                update_messages = [*messages, correction]
+                update_messages = [*update_base, correction]
                 continue
             break
         # Failed parsing/validation cannot overwrite the previous valid note.

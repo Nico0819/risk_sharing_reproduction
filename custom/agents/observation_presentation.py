@@ -26,6 +26,12 @@ def _cell(value: Any) -> str:
 
 def _settled_history(observation: dict[str, Any], agent_id: int) -> list[str]:
     partner_id = observation["partner_id"]
+    closing = observation.get("task") == "closing"
+    if closing and (
+        type(observation.get("last_settled_period")) is not int
+        or observation["last_settled_period"] != observation["current_period"]
+    ):
+        raise ValueError("Closing feedback must identify its last settled period")
     periods: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
     for record in observation.get("history", []):
         owner = record.get("agent_id")
@@ -35,7 +41,7 @@ def _settled_history(observation: dict[str, Any], agent_id: int) -> list[str]:
             or record.get("partner_id") != (partner_id if owner == agent_id else agent_id)
             or type(period) is not int or period < 1
             or period > observation["current_period"]
-            or (period == observation["current_period"] and observation.get("task") != "finished")
+            or (period == observation["current_period"] and observation.get("task") not in {"finished", "closing"})
             or owner in periods[period]
         ):
             raise ValueError("History must contain unique settled records for this participant's pair")
@@ -165,6 +171,8 @@ def _reading_guide(observation: dict[str, Any], agent_id: int) -> str:
         lines.append("There is no decision for you to submit in this task. Finish and wait.")
     elif task == "finished":
         lines.append("The experiment has finished. Do not submit another decision.")
+    elif task == "closing":
+        lines.append("Final settled feedback for your private note only. No further decision or environment step is permitted.")
     lines += ["", *_settled_history(observation, agent_id)]
     return "\n".join(lines)
 

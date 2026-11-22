@@ -34,9 +34,12 @@ from custom.config import (  # noqa: E402
     RuntimeConfigError,
     load_runtime_config,
 )
+from custom.participant_trace import ParticipantTraceRecorder, TRACE_FILE, summarize_reasoning_traces, redact_credentials
+from custom.agents.reasoning_trace import validate_reasoning_replay
 from custom.insurance_assignment import validate_assignment_configuration  # noqa: E402
 from custom.agents.observation_presentation import PRESENTATION_VERSION  # noqa: E402
 from protocol import paper_spec as protocol_spec  # noqa: E402
+from experiments.export_reasoning import finalize_reasoning_export  # noqa: E402
 
 
 DEFAULT_EXPERIMENT_TIMEOUT_SECONDS = 6 * 60 * 60
@@ -119,7 +122,7 @@ class RunLogger:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": event,
         }
-        row.update({key: _safe_log_value(value) for key, value in fields.items()})
+        row.update({key: _safe_log_value(value) for key, value in redact_credentials(fields).items()})
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
@@ -167,11 +170,18 @@ class BudgetedClient:
         deliberation_logger: RunLogger | None = None,
         agent_id: int | None = None,
         pair_id: int | None = None,
+        reasoning_logger: RunLogger | None = None,
+        backend: str = "scripted",
+        context_logger: RunLogger | None = None,
     ):
         self.inner = inner
         self.budget = budget
         self.max_output_tokens = max_output_tokens
         self.model_name = getattr(inner, "model_name", "")
+        self.backend = backend
+        self.reasoning_trace = ParticipantTraceRecorder(reasoning_logger, backend=backend, sanitize=_safe_log_value)
+        self.decision_request_indexes: dict[str, int] = {}
+        self.context_logger = context_logger
         self.enforce_participant_progression = enforce_participant_progression
         self.enforce_router_progression = enforce_router_progression
         self.actual_calls = 0
@@ -285,7 +295,9 @@ class BudgetedClient:
             parameters["required"] = required
 
         kwargs["tools"] = restricted
-        kwargs["tool_choice"] = "auto" if allowed_name is None else "required"
+        # Reasoning-enabled providers may reject forced tool use. Legal tool
+        # schemas and local validation still constrain the participant action.
+        kwargs["tool_choice"] = "auto" if self.backend == "llm" or allowed_name is None else "required"
 
     def _restrict_router_tools(self, messages, kwargs) -> bool:
         """Constrain routing and end completed RPCs without creating a decision."""
@@ -338,27 +350,52 @@ class BudgetedClient:
         if self.enforce_router_progression and self._restrict_router_tools(messages, kwargs):
             message = SimpleNamespace(content="Environment request completed.", tool_calls=[])
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        if self.enforce_participant_progression and self.backend == "llm" and kwargs.get("tools"):
+            validate_reasoning_replay(messages)
         self.budget.reserve()
         request_index = self.budget.calls
         self.actual_calls += 1
         if is_deliberation:
             self.deliberation_calls += 1
-            kwargs["max_output_tokens"] = min(
-                kwargs.get("max_output_tokens", 512), 512, self.max_output_tokens,
-            )
+            kwargs["max_output_tokens"] = self.max_output_tokens
         else:
             self._restrict_participant_tools(messages, kwargs)
             kwargs.setdefault("max_output_tokens", self.max_output_tokens)
-        # LLMClient clamps this to one actual attempt; no unbounded retry loop.
+        # Request the smallest framework retry setting. Installed LLMClient may
+        # still retry internally; our budget and trace count framework calls.
         kwargs["max_retries"] = 0
+        turn = ScriptedLLMClient._participant_turn(messages) if self.enforce_participant_progression else None
+        observation = turn[1] if turn else {}
+        context = ({"agent_id": self.agent_id, "pair_id": self.pair_id,
+                    "period": observation.get("current_period"), "task": observation.get("task"),
+                    "decision_id": observation.get("decision_id"), "model_messages": messages}
+                   if self.enforce_participant_progression else None)
+        if context is not None and self.context_logger is not None:
+            self.context_logger.write("participant_model_input", **context, request_index=request_index,
+                                      phase="deliberation" if is_deliberation else "decision")
+        if context and not is_deliberation and context.get("decision_id"):
+            self.decision_request_indexes[context["decision_id"]] = request_index
         started = time.monotonic()
         error_type = None
+        response = None
         try:
-            response = await self.inner.call(model=model, messages=messages, **kwargs)
+            provider_kwargs = dict(kwargs)
+            if self.backend == "llm":
+                # This framework uses Chat Completions. LiteLLM forwards the
+                # project option max_output_tokens unchanged unless mapped.
+                provider_kwargs["max_tokens"] = provider_kwargs.pop("max_output_tokens")
+            response = await self.inner.call(model=model, messages=messages, **provider_kwargs)
         except BaseException as exc:
             error_type = type(exc).__name__
             raise
         finally:
+            if self.enforce_participant_progression:
+                self.reasoning_trace.record(
+                    response=response, error_type=error_type, agent_id=self.agent_id,
+                    pair_id=self.pair_id, phase="deliberation" if is_deliberation else "decision",
+                    request_index=request_index, model=model or self.model_name, context=context,
+                    request_kwargs=kwargs, duration_seconds=time.monotonic() - started,
+                )
             if self.call_logger is not None:
                 self.call_logger.write(
                     "model_call_finished",
@@ -736,6 +773,10 @@ async def _run_async(
     router_clients: list[BudgetedClient] = []
 
     call_log = RunLogger(run_dir / "run.log", announce=False)
+    reasoning_path = run_dir / TRACE_FILE
+    reasoning_path.touch()
+    reasoning_log = RunLogger(reasoning_path, announce=False)
+    context_log = RunLogger(run_dir / "participant_contexts.jsonl", announce=False)
     deliberation_log = None
     if participant_deliberation:
         review_path = run_dir / "participant_deliberations.jsonl"
@@ -757,6 +798,8 @@ async def _run_async(
             enforce_participant_progression=True,
             call_logger=call_log, agent_id=agent_id,
             deliberation_logger=deliberation_log,
+            reasoning_logger=reasoning_log, backend=cfg.backend,
+            context_logger=context_log,
             pair_id=env.pair_by_agent[agent_id],
         )
         router_client = BudgetedClient(
@@ -890,6 +933,11 @@ async def _run_async(
             for row in control_adapter.participant_rejections[participant_rejection_cursor:]
         )
         participant_rejection_cursor = len(control_adapter.participant_rejections)
+        for row in step_actions:
+            if row.get("decision_source") == "participant_model":
+                client = participant_clients[row["agent_id"] - 1]
+                row["participant_request_index"] = client.decision_request_indexes.get(row.get("decision_id"))
+                row["participant_reasoning_file"] = TRACE_FILE
         _jsonl_append(action_path, step_actions)
         run_log.write(
             "tool_actions",
@@ -1104,7 +1152,8 @@ async def _run_async(
         "seed": seed,
         "model": cfg.model,
         "base_url": cfg.base_url,
-        "thinking": "disabled",
+        "thinking": "enabled" if cfg.backend == "llm" else "disabled",
+        **summarize_reasoning_traces((c.reasoning_trace for c in participant_clients), backend=cfg.backend),
         "participant_deliberation": participant_deliberation,
         "participant_deliberation_requests": sum(client.deliberation_calls for client in participant_clients),
         "participant_deliberation_file": "participant_deliberations.jsonl" if participant_deliberation else None,
@@ -1159,6 +1208,12 @@ async def _run_async(
         f"- insurance decisions: `{len(insurance_decisions)}`",
         "",
     ]
+    summary_lines.append(
+        "参与者接口返回的推理轨迹见 [participant_reasoning.jsonl](participant_reasoning.jsonl)，"
+        "实际输入见 [participant_contexts.jsonl](participant_contexts.jsonl)。"
+        "缺失、截断、请求失败和脱敏单独标记；scripted 记录不是供应商推理。"
+        "轨迹仅涵盖接口公开内容，不代表全部内部计算。\n"
+    )
     if participant_deliberation:
         summary_lines.append(
             "参与者的简短决策评估见 [participant_deliberations.jsonl](participant_deliberations.jsonl)；"
@@ -1268,7 +1323,7 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             seed=int(kwargs.get("seed", 2026)),
             run_dir=run_dir,
             request_limit=int(kwargs.get("request_limit", 80)),
-            max_output_tokens=int(kwargs.get("max_output_tokens", 2048)),
+            max_output_tokens=int(kwargs.get("max_output_tokens", 8192)),
             router_steps=int(kwargs.get("router_steps", 6)),
             agent_turns=int(kwargs.get("agent_turns", 4)),
             agent_concurrency=agent_concurrency,
@@ -1294,6 +1349,10 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             "treatment": treatment.value,
             "success": False,
             "stop_reason": "configuration_or_runtime_error",
+            "participant_reasoning_file": TRACE_FILE,
+            "participant_thinking": "enabled" if backend == "llm" else "not_applicable_scripted",
+            "router_thinking": "disabled" if backend == "llm" else "not_applicable_scripted",
+            "participant_reasoning_capture_complete": False if backend == "llm" else None,
             "error_type": type(exc).__name__,
             "error": safe_error,
             "log_file": "run.log",
@@ -1305,6 +1364,8 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             encoding="utf-8",
         )
         raise
+    finally:
+        finalize_reasoning_export(run_dir)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1328,13 +1389,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--request-limit", type=int, default=80)
-    parser.add_argument("--max-output-tokens", type=int, default=2048)
+    parser.add_argument("--max-output-tokens", type=int, default=8192,
+                        help="Total response budget including provider reasoning (default: 8192).")
     parser.add_argument("--router-max-steps", type=int, default=6)
     parser.add_argument("--agent-max-turns", type=int, default=4)
     parser.add_argument(
         "--participant-deliberation", action="store_true",
         help=("Add one private participant review before each transfer or insurance choice. "
-              "Uses extra requests; does not enable provider-native thinking or persistent memory."),
+              "Uses extra requests in addition to the already enabled participant reasoning; not persistent memory."),
     )
     parser.add_argument(
         "--agent-concurrency",

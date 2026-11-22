@@ -6,3 +6,9 @@ __pycache__/
 experiments/baseline/runs/
 experiments/25v/runs/
 experiments/25f/runs/
+experiments/preference_grid/runs/
+
+# Local reports and generated artifacts
+/artifacts/
+/meeting_report/
+/prompt_report/

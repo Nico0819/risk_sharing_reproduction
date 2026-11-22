@@ -35,13 +35,19 @@ from custom.config import (  # noqa: E402
     load_runtime_config,
 )
 from custom.insurance_assignment import validate_assignment_configuration  # noqa: E402
+from custom.participant_trace import (  # noqa: E402
+    TRACE_FILE, ParticipantTraceRecorder, redact_credentials, summarize_reasoning_traces,
+)
+from custom.agents.reasoning_trace import validate_reasoning_replay  # noqa: E402
 from protocol import paper_spec as protocol_spec  # noqa: E402
+from experiments.export_reasoning import finalize_reasoning_export  # noqa: E402
 from custom.agents.fixed_preferences_v1.profiles import (  # noqa: E402
     build_profiles, profile_sha256, validate_profile,
 )
 from custom.agents.observation_presentation import PRESENTATION_VERSION  # noqa: E402
 from custom.agents.fixed_preferences_memory_v1.state import (  # noqa: E402
-    MEMORY_UPDATE_MAX_ATTEMPTS, initial_state, load_state, memory_payload, memory_sha256, observation_sha256,
+    MAX_NOTE_CHARACTERS, MEMORY_UPDATE_MAX_ATTEMPTS, feedback_sha256,
+    initial_state, load_state, memory_payload, memory_sha256, observation_sha256,
     parse_memory_output, write_state,
 )
 
@@ -127,7 +133,7 @@ class RunLogger:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event": event,
         }
-        row.update({key: _safe_log_value(value) for key, value in fields.items()})
+        row.update({key: _safe_log_value(value) for key, value in redact_credentials(fields).items()})
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
@@ -180,6 +186,9 @@ class BudgetedClient:
         private_memory_logger: RunLogger | None = None,
         private_memory_scope: str | None = None,
         private_memory_path: Path | None = None,
+        reasoning_logger: RunLogger | None = None,
+        backend: str = "scripted",
+        memory_condition: str = "persistent",
     ):
         self.inner = inner
         self.budget = budget
@@ -206,10 +215,17 @@ class BudgetedClient:
         self.private_memory_logger = private_memory_logger
         self.private_memory_scope = private_memory_scope
         self.private_memory_path = private_memory_path
+        self.backend = backend
+        if memory_condition not in {"persistent", "fresh"}:
+            raise ValueError("memory_condition must be persistent or fresh")
+        self.memory_condition = memory_condition
+        self.reasoning_trace = ParticipantTraceRecorder(
+            reasoning_logger, backend=backend, sanitize=_safe_log_value,
+        )
         self._participant_tool_schemas: list[dict[str, Any]] = []
         self._router_tool_schemas: list[dict[str, Any]] = []
 
-    def _preference_context(self, messages):
+    def _preference_context(self, messages, *, memory_update=False):
         """Check the actual participant input against its bound private profile."""
         if not self.enforce_participant_progression:
             return
@@ -224,7 +240,7 @@ class BudgetedClient:
         if turn is None or turn[0] != self.agent_id or turn[1].get("agent_id") != self.agent_id:
             raise ValueError("Preference context must contain the bound participant observation")
         observation = turn[1]
-        private_memory = self._bound_private_memory(messages, observation)
+        private_memory = self._bound_private_memory(messages, observation, memory_update=memory_update)
         return {
             "agent_id": self.agent_id, "pair_id": self.pair_id,
             "period": observation.get("current_period"), "task": observation.get("task"),
@@ -246,7 +262,14 @@ class BudgetedClient:
             raise ValueError("Exactly one bound participant private memory is required")
         return json.loads(blocks[0])
 
-    def _bound_private_memory(self, messages, observation):
+    def _memory_view(self, state, *, memory_update=False):
+        view = memory_payload(state)
+        if memory_update and self.memory_condition == "fresh":
+            view["content"] = {"note": "", "evidence_periods": []}
+            view["evidence"] = []
+        return view
+
+    def _bound_private_memory(self, messages, observation, *, memory_update=False):
         """Check the actual note against this client's own persisted state."""
 
         supplied = self._memory_block(messages)
@@ -257,7 +280,7 @@ class BudgetedClient:
             partner_id=observation["partner_id"], scope_id=self.private_memory_scope,
             preferences_sha256=profile_sha256(self.preference_profile), observation=observation,
         )
-        expected = memory_payload(state)
+        expected = self._memory_view(state, memory_update=memory_update)
         if supplied != expected:
             raise ValueError("Participant private memory differs from its bound workspace state")
         return expected
@@ -374,7 +397,9 @@ class BudgetedClient:
             parameters["required"] = required
 
         kwargs["tools"] = restricted
-        kwargs["tool_choice"] = "auto" if allowed_name is None else "required"
+        # Reasoning-enabled providers may reject forced tool use. Legal tool
+        # schemas and local validation still constrain the participant action.
+        kwargs["tool_choice"] = "auto" if self.backend == "llm" or allowed_name is None else "required"
 
     def _restrict_router_tools(self, messages, kwargs) -> bool:
         """Constrain routing and end completed RPCs without creating a decision."""
@@ -438,17 +463,21 @@ class BudgetedClient:
         if self.enforce_router_progression and self._restrict_router_tools(messages, kwargs):
             message = SimpleNamespace(content="Environment request completed.", tool_calls=[])
             return SimpleNamespace(choices=[SimpleNamespace(message=message)])
-        if is_private_call:
-            private_limit = 1024 if is_memory_update else 512
-            kwargs["max_output_tokens"] = min(
-                kwargs.get("max_output_tokens", private_limit), private_limit, self.max_output_tokens,
-            )
-        else:
+        if not is_private_call:
             self._restrict_participant_tools(messages, kwargs)
-            kwargs.setdefault("max_output_tokens", self.max_output_tokens)
-        # LLMClient clamps this to one actual attempt; no unbounded retry loop.
+        # Native reasoning and the final JSON/tool call share the output budget.
+        # Earlier 512/1024 utility caps could consume it before a usable answer.
+        kwargs["max_output_tokens"] = self.max_output_tokens
+        if self.backend == "llm" and self.enforce_participant_progression and kwargs.get("tools"):
+            validate_reasoning_replay(messages)
+        # Request the smallest framework retry setting. Installed LLMClient may
+        # still retry internally; our budget and trace count framework calls.
         kwargs["max_retries"] = 0
-        context = self._preference_context(messages)
+        context = self._preference_context(messages, memory_update=is_memory_update)
+        if context is not None and context.get("task") == "closing" and not is_memory_update:
+            raise ValueError("Final feedback permits a private memory update only")
+        if is_memory_update:
+            attempt_fields["memory_update_kind"] = "closing" if context["task"] == "closing" else "feedback"
         self.budget.reserve()
         request_index = self.budget.calls
         self.actual_calls += 1
@@ -471,12 +500,27 @@ class BudgetedClient:
             )
         started = time.monotonic()
         error_type = None
+        response = None
         try:
-            response = await self.inner.call(model=model, messages=messages, **kwargs)
+            provider_kwargs = dict(kwargs)
+            if self.backend == "llm":
+                # This framework uses Chat Completions. LiteLLM forwards the
+                # project option max_output_tokens unchanged unless mapped.
+                provider_kwargs["max_tokens"] = provider_kwargs.pop("max_output_tokens")
+            response = await self.inner.call(model=model, messages=messages, **provider_kwargs)
         except BaseException as exc:
             error_type = type(exc).__name__
             raise
         finally:
+            if self.enforce_participant_progression:
+                self.reasoning_trace.record(
+                    response=response, error_type=error_type,
+                    agent_id=self.agent_id, pair_id=self.pair_id,
+                    phase=phase or "decision", request_index=request_index,
+                    model=model or self.model_name, context=context,
+                    request_kwargs=kwargs, duration_seconds=time.monotonic() - started,
+                    **attempt_fields,
+                )
             if self.call_logger is not None:
                 self.call_logger.write(
                     "model_call_finished",
@@ -506,13 +550,14 @@ class BudgetedClient:
         request_turn = ScriptedLLMClient._participant_turn(messages)
         if (
             request_turn is None or request_turn != (self.agent_id, observation)
-            or self._memory_block(messages) != memory_payload(previous_state)
+            or self._memory_block(messages) != self._memory_view(previous_state, memory_update=True)
             or parse_memory_output(raw_output) != new_state["content"]
             or self._last_memory_update_request_index is None
             or type(attempt) is not int or not 1 <= attempt <= MEMORY_UPDATE_MAX_ATTEMPTS
             or attempt != self._last_memory_update_attempt
             or new_state["revision"] != previous_state["revision"] + 1
             or new_state["last_observation_sha256"] != observation_sha256(observation)
+            or new_state["last_feedback_sha256"] != feedback_sha256(observation)
             or new_state["last_reviewed_period"] != observation["current_period"]
             or new_state["last_reviewed_task"] != observation["task"]
             or self.private_memory_path is None
@@ -527,6 +572,9 @@ class BudgetedClient:
             self.private_memory_logger.write(
                 "private_memory_updated", agent_id=self.agent_id, pair_id=self.pair_id,
                 period=observation["current_period"], task=observation["task"],
+                memory_update_kind="closing" if observation["task"] == "closing" else "feedback",
+                memory_condition=self.memory_condition,
+                content_changed=previous_state["content"] != new_state["content"],
                 request_index=self._last_memory_update_request_index,
                 attempt=attempt, max_attempts=MEMORY_UPDATE_MAX_ATTEMPTS,
                 memory_source="participant_model", observation_sha256=observation_sha256(observation),
@@ -546,7 +594,7 @@ class BudgetedClient:
         if observation.get("agent_id") != self.agent_id:
             raise ValueError("Rejected memory observation does not match the bound participant")
         self._check_memory_binding(previous_state, observation)
-        if self._memory_block(messages) != memory_payload(previous_state):
+        if self._memory_block(messages) != self._memory_view(previous_state, memory_update=True):
             raise ValueError("Rejected memory input does not match the previous state")
         if (
             type(attempt) is not int or not 1 <= attempt <= MEMORY_UPDATE_MAX_ATTEMPTS
@@ -678,19 +726,14 @@ class ScriptedLLMClient:
                         and row["had_transfer_opportunity"]]
             latest_partner = max(partner_rows, key=lambda row: row["period"], default=None)
             latest_own = max(own_rows, key=lambda row: row["period"], default=None)
-            def forecast(row):
-                return {"amount": None if row is None else row["transfer_sent"],
-                        "confidence": "unknown" if row is None else "low"}
             # These are offline fixtures for state transport. The scripted
             # economic policy below remains unchanged and ignores the note.
             note = {
-                "partner_assessment": (
+                "note": (
                     f"Participant {participant_id}: my current assessment uses only my pair's "
                     f"settled records through period {max((r['period'] for r in history), default=0)}."
+                    " Past transfers do not establish future choices or my partner's intentions."
                 ),
-                "expected_partner_transfer": forecast(latest_partner),
-                "perceived_partner_expectation": forecast(latest_own),
-                "uncertainties": "Past transfers do not guarantee future choices or reveal my partner's intentions.",
                 "evidence_periods": sorted({row["period"] for row in (latest_partner, latest_own) if row is not None}),
             }
             return self._response(content=json.dumps(note, ensure_ascii=False))
@@ -900,6 +943,7 @@ async def _run_async(
     agent_concurrency: int,
     timeout_seconds: float,
     participant_deliberation: bool = False,
+    memory_condition: str = "persistent",
     treatment: protocol_spec.Treatment = protocol_spec.Treatment.BASELINE,
     forced_assignment_probabilities: tuple[float, float, float] | None = None,
     assignment_seed: int | None = None,
@@ -921,6 +965,7 @@ async def _run_async(
         agent_concurrency=agent_concurrency,
         timeout_seconds=timeout_seconds,
         participant_deliberation=participant_deliberation,
+        memory_condition=memory_condition,
         observation_presentation=PRESENTATION_VERSION,
     )
 
@@ -960,6 +1005,9 @@ async def _run_async(
 
     call_log = RunLogger(run_dir / "run.log", announce=False)
     context_log = RunLogger(run_dir / "participant_contexts.jsonl", announce=False)
+    reasoning_path = run_dir / TRACE_FILE
+    reasoning_path.touch()
+    reasoning_log = RunLogger(reasoning_path, announce=False)
     memory_path = run_dir / "private_memory_updates.jsonl"
     memory_path.touch()
     memory_log = RunLogger(memory_path, announce=False)
@@ -988,11 +1036,14 @@ async def _run_async(
             preference_profile=profiles[agent_id], context_logger=context_log,
             private_memory_logger=memory_log, private_memory_scope=private_memory_scope,
             private_memory_path=run_dir / "agents" / f"agent_{agent_id:04d}" / "private_memory.json",
+            reasoning_logger=reasoning_log, backend=cfg.backend,
+            memory_condition=memory_condition,
         )
         router_client = BudgetedClient(
             router_inner, budget, max_output_tokens,
             enforce_router_progression=True,
             call_logger=call_log, agent_id=agent_id,
+            backend=cfg.backend,
         )
         participant_clients.append(participant_client)
         router_clients.append(router_client)
@@ -1033,6 +1084,7 @@ async def _run_async(
         "enable_memory": False,
         "private_memory_enabled": True,
         "private_memory_scope": private_memory_scope,
+        "memory_condition": memory_condition,
         "participant_deliberation": participant_deliberation,
         "enable_todo_list": False,
         "max_react_turns": agent_turns,
@@ -1223,6 +1275,42 @@ async def _run_async(
 
     # Records come directly from the environment, never from model text.
     _jsonl_append(records_path, env.history)
+    closing_memory_complete = False
+    closing_memory_failures = []
+    if stop_reason in {"smoke_period_limit", "natural_termination"} and env.completed_periods:
+        # Restore the same PersonAgents through the real batch runner. Their
+        # ordinary ask_env observation is now a trusted, settled-only view;
+        # no next-round income/offer or further economic request is permitted.
+        for adapter, _proxy in agent_services.values():
+            adapter.begin_closing_feedback()
+        remaining = timeout_seconds - (time.monotonic() - started) - 0.5
+        try:
+            if remaining <= 0:
+                raise TimeoutError("No runtime budget remains for final private notes")
+            closing_batches = await asyncio.wait_for(
+                asyncio.gather(*(_step_one_agent(agent_id) for agent_id in range(1, participants + 1))),
+                timeout=remaining,
+            )
+            closing_results = [item for batch in closing_batches for item in batch]
+            closing_memory_failures = [
+                {"agent_id": item.get("id"), "error": _redact_text(item.get("error", ""))}
+                for item in closing_results if not item.get("ok")
+            ]
+            closing_memory_complete = len(closing_results) == participants and not closing_memory_failures
+        except Exception as exc:
+            closing_memory_failures = [{"error": _redact_text(exc), "error_type": type(exc).__name__}]
+        run_log.write("closing_memory_finished", complete=closing_memory_complete,
+                      failures=closing_memory_failures, model_requests=budget.calls)
+    from experiments.export_memory import export_memory
+    memory_report = None
+    memory_report_error = None
+    try:
+        memory_report = export_memory(run_dir)
+    except (OSError, ValueError, TypeError) as exc:
+        # Reporting must not replace the original identity/schema failure or
+        # discard accepted experiment results. Raw logs remain authoritative.
+        memory_report_error = _redact_text(exc)
+        run_log.write("memory_report_failed", error=memory_report_error)
     insurance_decisions = [
         {
             "agent_id": agent_id, "pair_id": env.pair_by_agent[agent_id],
@@ -1317,6 +1405,9 @@ async def _run_async(
     if not successful and stop_reason in {"smoke_period_limit", "natural_termination"}:
         stop_reason = "incomplete_records"
 
+    reasoning_summary = summarize_reasoning_traces(
+        (client.reasoning_trace for client in participant_clients), backend=cfg.backend,
+    )
     manifest = {
         "schema_version": 1,
         "experiment_version": VERSION,
@@ -1326,6 +1417,15 @@ async def _run_async(
         "framework_memory_enabled": False,
         "private_memory_enabled": True,
         "memory_implementation": "participant_workspace_json",
+        "private_memory_schema_version": 2,
+        "memory_condition": memory_condition,
+        "memory_update_trigger": "new_legal_feedback",
+        "memory_note_max_characters": MAX_NOTE_CHARACTERS,
+        "closing_memory_complete": closing_memory_complete,
+        "closing_memory_failures": closing_memory_failures,
+        "memory_report": memory_report,
+        "memory_report_error": memory_report_error,
+        "memory_text_directory": "memory_text",
         "private_memory_update_requests": sum(client.memory_update_calls for client in participant_clients),
         "private_memory_update_count": sum(client.memory_update_commits for client in participant_clients),
         "private_memory_update_rejections": sum(client.memory_update_rejections for client in participant_clients),
@@ -1333,6 +1433,7 @@ async def _run_async(
         "private_memory_updates_file": "private_memory_updates.jsonl",
         "private_memory_files": "agents/agent_XXXX/private_memory.json",
         "memory_update_prompt_sha256": _file_hash(PROJECT_ROOT / "custom" / "agents" / VERSION / "memory_update.md"),
+        "memory_update_phase_prompt_sha256": _file_hash(PROJECT_ROOT / "custom" / "agents" / VERSION / "memory_update_phase.md"),
         "memory_usage_prompt_sha256": _file_hash(PROJECT_ROOT / "custom" / "agents" / VERSION / "memory_usage.md"),
         "preferences_file": "participant_profiles.json",
         "preferences_sha256": _file_hash(run_dir / "participant_profiles.json"),
@@ -1370,7 +1471,8 @@ async def _run_async(
         "seed": seed,
         "model": cfg.model,
         "base_url": cfg.base_url,
-        "thinking": "disabled",
+        "thinking": reasoning_summary["participant_thinking"],
+        **reasoning_summary,
         "participant_deliberation": participant_deliberation,
         "participant_deliberation_requests": sum(client.deliberation_calls for client in participant_clients),
         "participant_deliberation_file": "participant_deliberations.jsonl" if participant_deliberation else None,
@@ -1392,6 +1494,7 @@ async def _run_async(
         "payment_file": payment_path.name if payment_path else None,
         "stop_reason": stop_reason,
         "success": successful,
+        "memory_experiment_complete": successful and closing_memory_complete,
         "run_dir": str(run_dir),
         "failure_details": failure_details,
         "log_file": "run.log",
@@ -1407,15 +1510,26 @@ async def _run_async(
     summary_lines = [
         f"# {VERSION} / {treatment.value} {'full session' if full_session else 'smoke'} ({cfg.backend})",
         "",
-        "- 固定偏好：风险厌恶、优势不平等厌恶；启用参与者独立的持久私人记忆。",
+        f"- 固定偏好：风险厌恶、优势不平等厌恶；记忆条件：`{memory_condition}`。",
         "- 记忆由本人 participant model 更新；框架通用记忆关闭，不使用 embedding。",
+        "- 当前格式为 schema 2：自由短笔记和依据轮次，不强制预测金额；首轮无反馈时使用空笔记。",
         "- [私人记忆更新](private_memory_updates.jsonl) · 状态文件：`agents/agent_XXXX/private_memory.json`",
+        "- [逐人记忆更新报告](memory_text/all_agents.txt) · 独立文件：`memory_text/agent_XXXX.txt`",
+        f"- memory_report_error: `{memory_report_error}`。",
+        f"- 终局补记完成：`{closing_memory_complete}`；完整记忆实验完成：`{successful and closing_memory_complete}`。",
+        "- 终局补记仅供归档，不解释此前决定；未完成的终局更新见 manifest.closing_memory_failures。",
         f"- private_memory_update_requests: `{sum(client.memory_update_calls for client in participant_clients)}`",
         f"- private_memory_update_count: `{sum(client.memory_update_commits for client in participant_clients)}`",
         f"- private_memory_update_rejections: `{sum(client.memory_update_rejections for client in participant_clients)}`",
         f"- private_memory_update_max_attempts: `{MEMORY_UPDATE_MAX_ATTEMPTS}`（含初次请求，额外修正仍计入请求预算）",
         f"- observation_presentation: `{PRESENTATION_VERSION}`",
         "- [个人偏好配置](participant_profiles.json) · [实际 participant 输入](participant_contexts.jsonl)",
+        "- [参与者推理轨迹](participant_reasoning.jsonl)：接口返回的推理字段、最终输出、工具参数及截断/缺失状态。",
+        f"- participant_thinking: `{reasoning_summary['participant_thinking']}`；router_thinking: `{reasoning_summary['router_thinking']}`",
+        f"- participant_reasoning_status_counts: `{reasoning_summary['participant_reasoning_status_counts']}`",
+        f"- participant_reasoning_truncated_responses: `{reasoning_summary['participant_reasoning_truncated_responses']}`",
+        f"- participant_reasoning_capture_complete: `{reasoning_summary['participant_reasoning_capture_complete']}`",
+        "- 推理轨迹仅代表接口公开返回的文本；不等于模型全部内部计算。scripted 记录不作为真实推理证据。",
         "- low/medium/high 为研究配置，尚未经人类数据校准。",
         "- scripted policy 沿用基准工程策略，不模拟偏好或私人记忆的经济效应。",
         f"- success: `{successful}`",
@@ -1520,6 +1634,7 @@ def _version_source_hashes() -> dict[str, str]:
         "custom/agents/fixed_preferences_memory_v1/participant.py",
         "custom/agents/fixed_preferences_memory_v1/state.py",
         "custom/agents/fixed_preferences_memory_v1/memory_update.md",
+        "custom/agents/fixed_preferences_memory_v1/memory_update_phase.md",
         "custom/agents/fixed_preferences_memory_v1/memory_usage.md",
         "custom/agents/observation_presentation.py",
         "custom/agents/fixed_preferences_v1/participant.md",
@@ -1530,6 +1645,10 @@ def _version_source_hashes() -> dict[str, str]:
         "custom/envs/risk_sharing_env.py",
         "custom/insurance_assignment.py",
         "custom/config.py",
+        "custom/participant_trace.py",
+        "custom/agents/reasoning_trace.py",
+        "experiments/export_memory.py",
+        "experiments/export_reasoning.py",
         "protocol/paper_spec.py",
     )
     return {path: _file_hash(PROJECT_ROOT / path) for path in paths}
@@ -1543,6 +1662,9 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
     participants = kwargs.get("participants", 4)
     agent_concurrency = kwargs.get("agent_concurrency", 1)
     _validate_population(participants, agent_concurrency)
+    memory_condition = kwargs.get("memory_condition", "persistent")
+    if memory_condition not in {"persistent", "fresh"}:
+        raise ValueError("memory_condition must be persistent or fresh")
     profiles, preference_assignment = build_profiles(
         participants, kwargs.get("preference_seed", 2026), kwargs.get("profiles_file"),
     )
@@ -1581,12 +1703,13 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             request_limit=int(kwargs.get(
                 "request_limit", 80 if treatment is protocol_spec.Treatment.BASELINE else 400,
             )),
-            max_output_tokens=int(kwargs.get("max_output_tokens", 2048)),
+            max_output_tokens=int(kwargs.get("max_output_tokens", 8192)),
             router_steps=int(kwargs.get("router_steps", 6)),
             agent_turns=int(kwargs.get("agent_turns", 4)),
             agent_concurrency=agent_concurrency,
             timeout_seconds=timeout_seconds,
             participant_deliberation=bool(kwargs.get("participant_deliberation", False)),
+            memory_condition=memory_condition,
             forced_assignment_probabilities=assignment_probabilities,
             assignment_seed=kwargs.get("assignment_seed"),
             profiles=profiles,
@@ -1616,6 +1739,11 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
             "preferences_sha256": _file_hash(run_dir / "participant_profiles.json"),
             "preference_assignment": preference_assignment,
             "backend": backend,
+            "thinking": "enabled" if backend == "llm" else "not_applicable_scripted",
+            "participant_thinking": "enabled" if backend == "llm" else "not_applicable_scripted",
+            "router_thinking": "disabled" if backend == "llm" else "not_applicable_scripted",
+            "participant_reasoning_file": TRACE_FILE,
+            "participant_reasoning_capture_complete": False if backend == "llm" else None,
             "treatment": treatment.value,
             "success": False,
             "stop_reason": "configuration_or_runtime_error",
@@ -1626,10 +1754,12 @@ def run_experiment(**kwargs: Any) -> dict[str, Any]:
         }
         _write_manifest(run_dir / "manifest.json", manifest)
         (run_dir / "summary.md").write_text(
-            f"# {treatment.value} run ({backend})\n\n- observation_presentation: `{PRESENTATION_VERSION}`\n- success: `False`\n- stop_reason: `configuration_or_runtime_error`\n- error: `{type(exc).__name__}: {safe_error}`\n\n- diagnostics: `run.log`\n",
+            f"# {treatment.value} run ({backend})\n\n- observation_presentation: `{PRESENTATION_VERSION}`\n- success: `False`\n- stop_reason: `configuration_or_runtime_error`\n- error: `{type(exc).__name__}: {safe_error}`\n\n- diagnostics: `run.log`\n- 推理请求记录（若已开始调用）：[participant_reasoning.jsonl](participant_reasoning.jsonl)\n",
             encoding="utf-8",
         )
         raise
+    finally:
+        finalize_reasoning_export(run_dir)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1665,13 +1795,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--request-limit", type=int, default=80)
-    parser.add_argument("--max-output-tokens", type=int, default=2048)
+    parser.add_argument("--max-output-tokens", type=int, default=8192,
+                        help="Per-request output budget, including native reasoning and the final answer (default: 8192).")
     parser.add_argument("--router-max-steps", type=int, default=6)
     parser.add_argument("--agent-max-turns", type=int, default=4)
+    parser.add_argument("--memory-condition", choices=("persistent", "fresh"), default="persistent",
+                        help="Persistent private notes (default), or matched fresh reflection without previous notes.")
     parser.add_argument(
         "--participant-deliberation", action="store_true",
         help=("Add one private participant review before each transfer or insurance choice. "
-              "Uses extra requests; does not enable provider-native thinking or persistent memory."),
+              "Uses extra requests in addition to already enabled participant reasoning; not the private memory update."),
     )
     parser.add_argument(
         "--agent-concurrency",
@@ -1741,6 +1874,7 @@ def main(
             agent_turns=args.agent_max_turns,
             agent_concurrency=args.agent_concurrency,
             participant_deliberation=args.participant_deliberation,
+            memory_condition=args.memory_condition,
             timeout_seconds=args.timeout_seconds,
             request_timeout=args.request_timeout,
             forced_assignment_probabilities=getattr(args, "forced_assignment_probabilities", None),
@@ -1751,8 +1885,11 @@ def main(
     except Exception as exc:
         print(f"运行失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps({"experiment_version": VERSION, "success": manifest.get("success"), "stop_reason": manifest.get("stop_reason"), "run_dir": manifest.get("run_dir")}, ensure_ascii=False))
-    return 0 if manifest.get("success") else 1
+    print(json.dumps({"experiment_version": VERSION, "success": manifest.get("success"),
+                      "closing_memory_complete": manifest.get("closing_memory_complete", False),
+                      "memory_experiment_complete": manifest.get("memory_experiment_complete", False),
+                      "stop_reason": manifest.get("stop_reason"), "run_dir": manifest.get("run_dir")}, ensure_ascii=False))
+    return 0 if manifest.get("memory_experiment_complete") else 1
 
 
 if __name__ == "__main__":

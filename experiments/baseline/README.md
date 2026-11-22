@@ -26,7 +26,7 @@ LLM_BASE_URL=https://your-provider.example/v1
 LLM_MODEL=your-model-name
 ```
 
-入口将同一份 LLM 配置用于参与者和 Router 的独立客户端，并关闭供应商原生 thinking。真实密钥不会
+入口将同一份 LLM 配置用于参与者和 Router 的独立客户端，参与者开启原生 thinking，Router 关闭。真实密钥不会
 进入 prompt、Agent 记忆、实验结果或 manifest。`.env` 已在 `.gitignore` 中排除。
 
 ## 离线 smoke 验证
@@ -91,8 +91,8 @@ cd /home/zhicheng/risk_sharing_reproduction
   --agent-concurrency 4 --request-limit 100 --max-output-tokens 512
 ```
 
-25V、25F 入口也接受这个参数。原有命令不加它就保留原来的行为，方便作为对照。
-这不是启用供应商的原生推理模式，也没有增加跨轮的私人记忆；下一轮仍从环境收到本组历史。
+25V、25F 入口也接受这个参数。不加它就不增加这次评估调用。
+参与者原生推理现在已经默认开启；这个参数额外增加一次文字评估，不增加跨轮私人记忆，下一轮仍从环境收到本组历史。
 评估提示词放在 `custom/agents/risk_sharing_deliberation.md`，不规定转账金额或投保策略。
 评估阶段没有工具，文本中的金额不会被自动提交；最终选择仍由参与者的后续模型调用产生，
 Router 只接收最终提交请求。空白、截断或包含工具调用的评估会报错，不会自动补决定。
@@ -100,13 +100,15 @@ Router 只接收最终提交请求。空白、截断或包含工具调用的评�
 四人正常一轮的调用从 6 次增加到 8 次，其中新增 2 次是高收入参与者的评估；25V 第 16 轮
 投保还会额外增加 4 次评估。无重试时，完整 Baseline 为 384—400 次，25V 为 396—412 次。
 这些调用都计入 `--request-limit` 和 token 用量；评估单次输出上限为
-`min(512, --max-output-tokens)`。运行会更慢，实际费用取决于模型和历史长度。
+`--max-output-tokens`（默认 8192），预算包含推理和最终输出。运行会更慢，实际费用取决于模型和历史长度。
 
 开启后，`participant_deliberations.jsonl` 记录每次评估的 Agent、轮次、decision_id、
 输入消息和评估文字，可与 `agent_actions.jsonl` 中相同凭证的最终选择核对。
 该文件是研究者日志，不会提供给搭档或其他参与者；评估文字只回到该 Agent 当前任务的上下文。
 `run.log` 的 `phase` 区分评估、决策和路由；`manifest.json` 保存开关、评估请求数与提示词哈希。
 模型给出的评估只是决策说明，不等于完整的内部思考，也不能据此认定行为更接近人类。
+
+无论是否开启额外评估，`participant_reasoning.jsonl` 都记录每次参与者客户端调用实际返回的推理字段、最终文字、工具参数和完成状态，通过 Agent 与请求序号关联 `participant_contexts.jsonl` 和环境接受的选择。缺失、截断和错误会明确标记；`scripted` 记录不会算作真实推理。使用 `python -m experiments.view_reasoning <运行目录> --agent-id 1` 可查看。该文件记录一次框架客户端调用的最终响应或异常，不包含内部每次网络重试；也不是完整内部计算记录。字段说明见[推理轨迹](../fixed_preferences_memory_v1/README.md#查看推理轨迹)。
 
 ## Participant 决策边界
 
@@ -160,7 +162,7 @@ manifest 分别统计 `participant_model_requests` 和 `router_model_requests`�
 cd /home/zhicheng/risk_sharing_reproduction
 .venv/bin/python -m experiments.baseline.run_smoke \
   --backend llm --participants 20 --full-session --seed 2026 \
-  --request-limit 20000 --max-output-tokens 2048 \
+  --request-limit 20000 --max-output-tokens 8192 \
   --router-max-steps 4 --agent-max-turns 4 \
   --agent-concurrency 20 \
   --timeout-seconds 86400 --request-timeout 120

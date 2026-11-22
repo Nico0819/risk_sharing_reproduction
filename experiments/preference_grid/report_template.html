@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>人格配对实验 · 数据分析</title>
+<style>
+:root{--ink:#182b3d;--muted:#596c7e;--line:#dce5eb;--blue:#216eaa;--green:#168577;--orange:#c87426}*{box-sizing:border-box}body{margin:0;background:#f3f6f8;color:var(--ink);font:15px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1480px;margin:auto;padding:30px}header{padding:12px 0 20px}h1{font-size:30px;margin:5px 0}h2{font-size:21px;margin:0 0 10px}h3{font-size:16px;margin:12px 0}p{margin:8px 0}a{color:var(--blue)}.eyebrow{letter-spacing:2px;font-size:12px;color:var(--muted)}.note{color:var(--muted);font-size:13px}.warn{padding:12px 16px;border-left:4px solid var(--orange);background:#fff5e9}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card,section{background:white;border:1px solid var(--line);border-radius:12px;padding:20px}.card strong{display:block;font-size:29px}.card span{color:var(--muted);font-size:13px}section{margin:20px 0;scroll-margin-top:100px}.controls{position:sticky;top:0;z-index:3;padding:12px 18px;background:#fffefaee;backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}select,input,button{font:inherit;border:1px solid #bacbd7;border-radius:6px;padding:5px 9px;background:white;color:var(--ink)}button{cursor:pointer}button:hover{background:#edf5fa}select{max-width:240px}label{font-size:13px}nav{display:flex;flex-wrap:wrap;gap:8px 18px;margin:14px 0}nav a{text-decoration:none;font-size:13px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}.grid2>*{min-width:0}.chart{min-height:270px}.chart svg{width:100%;height:auto;display:block}.scroll{overflow:auto;max-height:570px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th{background:#f0f5f8;color:#385168;position:sticky;top:0;z-index:1}th:first-child,td:first-child{text-align:left}td small{display:block;color:var(--muted);font-size:11px}.cell{text-align:center!important;min-width:88px;cursor:pointer;border:1px solid #e2e8ec}.cell[aria-selected=true]{outline:3px solid var(--blue);outline-offset:-3px}.legend{display:flex;flex-wrap:wrap;gap:7px 18px;font-size:12px}.pill{display:inline-block;border-radius:20px;background:#eaf1f6;padding:3px 10px;font-size:12px}.download{display:flex;flex-wrap:wrap;gap:7px 18px}details{margin:12px 0}summary{cursor:pointer;font-weight:600}.findings{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.finding{background:#f5f8fa;padding:14px;border-radius:8px;font-size:14px}.empty{color:var(--muted);padding:30px;text-align:center}.pager{display:flex;align-items:center;gap:12px;margin:12px 0}#legend{margin-bottom:12px}code{font-size:12px;background:#edf2f5;padding:1px 4px}footer{color:var(--muted);font-size:12px;margin:25px 0}.key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px}@media(max-width:850px){.chart{overflow-x:auto}.chart svg{min-width:700px}main{padding:14px}.grid2{grid-template-columns:1fr}.cards,.findings{grid-template-columns:repeat(2,1fr)}.controls{position:static}h1{font-size:25px}}@media print{body{background:white}main{max-width:none;padding:0}.controls{position:static}.scroll{max-height:none}section{break-inside:avoid}.pager{display:none}a{color:inherit}}
+</style></head>
+<body><main>
+<header><div class="eyebrow">PREFERENCE GRID / RESEARCH REPORT</div><h1>人格配对实验 · 数据分析</h1><p id="overall"></p><p class="note">固定偏好＋私人记忆 · Baseline / 25V / 25F · 独立配对实验为统计单位</p></header>
+<div class="cards" id="overview"></div>
+<nav><a href="#summary">总体与分布</a><a href="#time">轮次变化</a><a href="#pairing">配对与重复</a><a href="#preferences">偏好维度</a><a href="#changes">阶段变化</a><a href="#insurance">保险</a><a href="#reciprocity">互惠条件</a><a href="#quality">自然结束分布</a><a href="#details">实验明细</a><a href="#methods">方法与导出</a></nav>
+<div class="controls"><label>当前实验 <select id="treatment"></select></label><label>阶段 <select id="stage"></select></label><label>指标 <select id="metric"></select></label><span class="note">总体对比保留计划内全部实验。顶部指标用于总体、配对、阶段变化和保险分组。</span></div>
+<section id="summary"><h2>总体差异与重复间波动</h2><div id="findings" class="findings"></div><div class="grid2"><div><h3>场次均值及 95% 区间</h3><div class="chart" id="treatment-chart"></div></div><div><h3>每场平均转账的分布</h3><div class="chart" id="distribution-chart"></div></div></div><div class="scroll"><table id="treatment-table"></table></div><p class="note">先计算每场的阶段均值，再对场次等权。SD 与四分位数描述重复间差异；95% 区间描述均值估计的不确定性。阶段均值分布中的 0 表示该阶段每次机会都选择 0。</p></section>
+<section id="time"><h2>行为怎样随轮次变化</h2><label>曲线指标 <select id="time-metric"><option value="transfer_mean">平均转账</option><option value="transfer_positive_rate">正转账比例</option><option value="income_gap_mean">绝对收入差</option></select></label><div class="chart" id="time-chart"></div><p class="note">每个点是一轮内各独立配对实验的均值，阴影为逐点 95% 区间。虚线标出第 16 轮保险引入、第 31 轮撤销。鼠标停留查看当轮 n；49–50 轮仅包含尚未结束的场次，样本构成会改变。</p></section>
+<section id="pairing"><h2>81 种配对：均值背后是否稳定</h2><div id="legend" class="legend"></div><p class="note">行＝第一位人格，列＝第二位人格；这不是固定的 Agent 编号。每格显示均值、有效重复数和重复间 SD。点击格子查看该组合的逐次结果。n 显示所选指标的有效场次与计划场次。</p><div class="scroll"><table id="matrix"></table></div><h3 id="cell-title"></h3><div class="chart" id="repeat-chart"></div><div class="scroll"><table id="repeat-table"></table></div><details><summary>逐次重复的数值和场次记录</summary><div class="scroll"><table id="individual-repeats"></table></div></details><p class="note">每个圆点是一场独立重复，横线标出均值，竖线标出均值的 95% 区间。不同实验的 r01 不构成匹配样本。每格通常只有 10 次重复，不应只按均值对组合排“优劣”。</p><details><summary>交换第一位与第二位后，结果有多大差异</summary><p class="note">以下为 A__B − B__A 的平均转账差，使用独立样本 Welch 比较。按绝对差排序方便检查；这是探索性方向检查，Holm p 覆盖全部阶段、实验和方向比较。</p><div class="scroll"><table id="orientation-table"></table></div></details></section>
+<section id="preferences"><h2>本人偏好与搭档偏好的关联</h2><label>查看维度 <select id="dimension"><option value="risk_aversion">本人风险厌恶</option><option value="advantageous_inequality_aversion">本人优势不平等厌恶</option><option value="partner_risk_aversion">搭档风险厌恶</option><option value="partner_advantageous_inequality_aversion">搭档优势不平等厌恶</option><option value="personality_id">本人九种人格</option></select></label><label>行为指标 <select id="agent-metric"><option value="transfer_mean">有机会时平均转账</option><option value="transfer_positive_rate">有机会时正转账比例</option><option value="income_mean">每轮平均收入</option><option value="income_sd">个人收入波动</option></select></label><div class="chart" id="preference-chart"></div><div class="scroll"><table id="preference-table"></table></div><p class="note">先对每个 Agent 的阶段记录计算指标，再对 Agent 等权。转账只统计实际发送者机会，没有机会的 0 不算拒绝分享。置信区间按配对实验聚类，避免把同场两个人当作独立样本。每次按所选的一项偏好分组，表中给出各组的平均值。</p></section>
+<section id="changes"><h2>保险引入、撤销前后的变化</h2><label>阶段变化 <select id="transition"><option value="introduction">16–30 减 1–15：引入</option><option value="removal">31–45 减 16–30：撤销</option><option value="post_vs_pre">31–45 减 1–15：前后</option></select></label><div class="chart" id="change-chart"></div><h3>各实验内部的同场变化</h3><div class="scroll"><table id="change-table"></table></div><h3>变化量相对 Baseline 的差异</h3><div class="scroll"><table id="did-table"></table></div><p class="note">每场先算后阶段 − 前阶段，所以场内配对得以保留；跨实验再比较独立场次的变化。没有匹配随机收入路径，也未验证识别假设，因此这里报告描述性变化差，不将其直接命名为保险的因果效果。</p><details><summary>当前阶段：三类实验之间的水平差异</summary><div class="scroll"><table id="contrast-table"></table></div><p class="note">Holm 校正覆盖全部水平比较和变化差比较，未校正 p 仅供核对。置信区间仍为逐项区间，不能按多格区间是否跨零宣称整体显著。</p></details></section>
+<section id="insurance"><h2>25V 自愿购买与 25F 强制分配</h2>__INSURANCE_SUMMARY__
+<label>保险明细 <select id="insurance-treatment"></select></label><p id="insurance-context" class="note"></p><div class="grid2"><div><h3 id="insurance-rate-title">各人格的保险比例</h3><div class="chart" id="insurance-rate-chart"></div><div class="scroll"><table id="insurance-rate-table"></table></div></div><div><h3>不同获保人数下的行为</h3><div class="chart" id="insurance-group-chart"></div></div></div><div class="scroll"><table id="insurance-table"></table></div><p class="note">25V 的组别来自第 16 轮自主购买，存在自选择；25F 来自环境分配，获保率不是购买意愿。前期数据也按第 16 轮的选择/分配追溯分组。“0 人”没有数据时显示缺失，不能当作 0 转账。25F 的概率来自本批运行配置，论文概率仍未确认。</p></section>
+<section id="reciprocity"><h2>搭档上次怎样做，自己这次怎样做</h2><div class="chart" id="reciprocity-chart"></div><div class="scroll"><table id="reciprocity-table"></table></div><p class="note">对每次发送者机会，寻找此前最近一次搭档作为发送者的已结算选择。区分尚无历史、搭档上次转 0、搭档上次转正数；先在 Agent 的各类机会内平均，再等权汇总，区间按场次聚类。此关联同时受人格、阶段和历史选择影响，不能单独识别互惠动机或记忆的因果作用。</p></section>
+<section id="quality">
+<h2>实验在哪一轮自然结束</h2>
+<p>每场在前 47 轮继续进行。进入第 48 或 49 轮后，该轮结束的设定概率为 78%。仍进入第 50 轮的场次全部结束。</p>
+<div class="scroll"><table id="termination-table"></table></div>
+<p>__ENDING_NOTE__</p>
+<p class="note">全组占比 = 该轮结束场数 ÷ 该实验自然结束总场数。条件结束率 = 该轮结束场数 ÷ 实际进入该轮的场数。最后一列给出相应的协议概率。分母为零时显示 —。</p>
+<div class="chart" id="termination-chart"></div>
+<details><summary>原始记录覆盖情况</summary>__RECORD_COVERAGE__</details>
+</section>
+<section id="details"><h2>完整实验明细与原始证据</h2>
+<label>搜索组合 / 重复 <input id="job-search" placeholder="例如 P1__P7 或 r04"></label>
+<button id="cell-filter">只看所选配对</button><button id="clear-filter">清除筛选</button>
+<div class="pager"><button id="previous-page">上一页</button><span id="page-label"></span><button id="next-page">下一页</button></div>
+<div class="scroll"><table><thead><tr><th>组合</th><th>重复</th><th>结算轮数</th><th>双方人格与实际编号</th><th>记录</th></tr></thead><tbody id="jobs"></tbody></table></div></section>
+<section id="methods"><h2>统计口径与可复核文件</h2><p>研究对象是这一组模型、提示词和记忆设置下的模拟行为，结果不自动等于人类偏好或论文中的行为。总报告不会把记忆正文自动编码成“信任分数”，也没有估计私人记忆的因果效果。</p><ul><li>页面默认使用每场全部已结算轮次，各场等权。可选 1–45 轮比较共同窗口，也可选 46+ 单独分析随机延长阶段。</li><li>独立场次均值的区间采用 Student t；个人层指标按场次聚类。均值、SD、中位数、四分位数分别展示，不把它们混用。</li><li>样本少于 2 不给置信区间。全零或完全相同的重复仍可能有未观察到的不确定性，不能把零宽区间当成确定规律。零方差差异不产生显著性检验。</li><li>每场收入波动＝两个人各自在阶段内的实际收入总体标准差的平均。它是结果波动，不是效用或风险厌恶系数。</li><li>Baseline 的每人平均收入 225 来自总收入守恒；转账改变分配和个人风险，不改变该轮配对总收入。不同保险组还存在保费和赔付，不能把所有收入变化都归因于转账。</li><li>支付为随机抽取已完成的一轮；全期收入均值对应实现历史下的抽轮期望，不是累加支付。</li><li>不同实验下相同的重复编号使用各自的环境种子。跨实验比较以独立场次为单位。</li></ul><div class="download" id="downloads"></div></section>
+<footer>所有图表由已保存记录在本地计算；打开本报告不调用模型或联网。图表悬停可查看数值，表格可横向滚动。</footer>
+</main><script id="batch-data" type="application/json">__DATA__</script>
+<script>
+'use strict';
+const d=JSON.parse(document.getElementById('batch-data').textContent),a=d.analysis,$=id=>document.getElementById(id);
+const colors={baseline:'#216eaa','25v':'#168577','25f':'#c87426'},names={baseline:'Baseline','25v':'25V','25f':'25F'},levels={low:'低',medium:'中',high:'高'};
+const metricNames={transfer_mean:'平均转账',transfer_positive_rate:'正转账比例',income_mean:'每人平均收入',income_gap_mean:'绝对收入差',income_sd:'个人收入波动',zero_transfer_rate:'零转账比例',equal_income_rate:'最终收入相等比例',equalization_ratio:'实际转账 / 平分所需金额'};
+const stageNames={all:'全部已结算轮次','1-45':'1–45：固定共同区间','1-15':'1–15：保险前','16-30':'16–30：保险期','31-45':'31–45：撤销后','46+':'46+：随机延长'};
+const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n},valid=x=>typeof x==='number'&&Number.isFinite(x),fmt=(x,n=2)=>valid(x)?x.toFixed(n):'—',pct=x=>valid(x)?(x*100).toFixed(1)+'%':'—',ci=r=>valid(r.ci_low)?`[${fmt(r.ci_low)}, ${fmt(r.ci_high)}]`:'—';
+const pformat=p=>!valid(p)?'—':p<.0001?'<0.0001':p.toFixed(4),treatment=()=>$('treatment').value,stage=()=>$('stage').value,metric=()=>$('metric').value;
+let selectedCombo=d.sessions[0]?.combination_id||'P1__P1',page=0;
+const completedSessions = d.sessions.filter(s => s.status === 'complete');
+const insuranceTreatments = d.treatments.filter(t => t === '25v' || t === '25f');
+const plannedByCell = new Map();
+for (const session of d.sessions) {
+    const key = session.treatment + '/' + session.combination_id;
+    plannedByCell.set(key, (plannedByCell.get(key) || 0) + 1);
+}
+function options(id,items){for(const [value,label] of items){const o=el('option',label);o.value=value;$(id).append(o)}}
+options('insurance-treatment', insuranceTreatments.map(t => [t, t === '25v' ? '25V 自愿购买' : '25F 强制分配']));
+$('insurance-treatment').disabled = !insuranceTreatments.length;
+options('treatment',d.treatments.map(t=>[t,names[t]||t]));options('stage',d.stages.map(s=>[s,stageNames[s]||s]));options('metric',Object.entries(metricNames));$('stage').value='all';
+function table(id, headers, rows, noRows='当前筛选下没有可计算的记录') {
+    const node = $(id);
+    node.replaceChildren();
+    const headerRow = el('tr');
+    for (const name of headers) headerRow.append(el('th', name));
+    const head = el('thead');
+    head.append(headerRow);
+    const body = el('tbody');
+    for (const values of rows) {
+        const tr = el('tr');
+        for (const value of values) {
+            const cell = el('td');
+            if (value instanceof Node) cell.append(value);
+            else cell.textContent = value ?? '—';
+            tr.append(cell);
+        }
+        body.append(tr);
+    }
+    if (!rows.length) {
+        const tr = el('tr'), cell = el('td', noRows, 'empty');
+        cell.colSpan = headers.length;
+        tr.append(cell);
+        body.append(tr);
+    }
+    node.append(head, body);
+}
+function svg(id,width=840,height=310){const target=$(id);target.replaceChildren();const holder=el('div');holder.innerHTML='<svg role="img"></svg>';const s=holder.firstChild;s.setAttribute('viewBox',`0 0 ${width} ${height}`);s.setAttribute('aria-label',target.parentElement.querySelector('h3,h2')?.textContent||'统计图');target.append(s);return s}
+function shape(s,tag,attrs,text){const n=document.createElementNS(s.namespaceURI,tag);for(const [key,value] of Object.entries(attrs))n.setAttribute(key,String(value));if(text!==undefined)n.textContent=text;s.append(n);return n}
+function tip(s,n,text){const title=document.createElementNS(s.namespaceURI,'title');title.textContent=text;n.append(title)}
+function empty(id,text='该筛选下没有足够的有效记录'){const n=$(id);n.replaceChildren(el('p',text,'empty'))}
+function legend(s,items,y=290){items.forEach((v,i)=>{shape(s,'rect',{x:70+i*190,y:y-9,width:10,height:10,fill:v.color});shape(s,'text',{x:86+i*190,y:y,'font-size':12,fill:'#526779'},v.label)})}
+function bars(id,rows,{zero=true}={}){const filtered=rows.filter(r=>valid(r.mean));if(!filtered.length)return empty(id);const w=840,h=Math.max(290,filtered.length*40+65),s=svg(id,w,h),left=190,right=760,top=22,bottom=h-35;let lo=Math.min(...filtered.map(r=>valid(r.ci_low)?r.ci_low:r.mean)),hi=Math.max(...filtered.map(r=>valid(r.ci_high)?r.ci_high:r.mean));if(zero){lo=Math.min(0,lo);hi=Math.max(0,hi)}if(lo===hi){lo-=1;hi+=1}const pad=(hi-lo)*.06;lo-=pad;hi+=pad;const x=v=>left+(v-lo)/(hi-lo)*(right-left);for(let i=0;i<=4;i++){const value=lo+(hi-lo)*i/4;shape(s,'line',{x1:x(value),x2:x(value),y1:top,y2:bottom,stroke:'#e6edf2'});shape(s,'text',{x:x(value),y:h-12,'text-anchor':'middle','font-size':11,fill:'#5a6d7d'},fmt(value,1))}shape(s,'line',{x1:x(0),x2:x(0),y1:top,y2:bottom,stroke:'#9bb0c0','stroke-dasharray':'3 3'});filtered.forEach((r,i)=>{const y=top+(i+.5)*(bottom-top)/filtered.length;shape(s,'text',{x:left-12,y:y+4,'text-anchor':'end','font-size':12,fill:'#294458'},r.label);if(valid(r.ci_low)&&valid(r.ci_high)){shape(s,'line',{x1:x(r.ci_low),x2:x(r.ci_high),y1:y,y2:y,stroke:r.color||colors[treatment()],'stroke-width':3});for(const v of [r.ci_low,r.ci_high])shape(s,'line',{x1:x(v),x2:x(v),y1:y-5,y2:y+5,stroke:r.color||colors[treatment()]})}const dot=shape(s,'circle',{cx:x(r.mean),cy:y,r:5,fill:r.color||colors[treatment()]});tip(s,dot,`${r.label}: ${fmt(r.mean)}; 95% ${ci(r)}; n=${r.n_pairs??r.n??'—'}`);shape(s,'text',{x:right+12,y:y+4,'font-size':12,fill:'#294458'},fmt(r.mean))})}
+function drawTime(){const m=$('time-metric').value,rows=a.temporal.filter(r=>r.metric===m&&valid(r.mean));if(!rows.length)return empty('time-chart');const s=svg('time-chart',1100,345),left=65,right=1055,top=20,bottom=280,maxPeriod=Math.max(1,...rows.map(r=>r.period));let lo=Math.min(0,...rows.map(r=>r.ci_low??r.mean)),hi=Math.max(1,...rows.map(r=>r.ci_high??r.mean));const x=p=>left+(p-1)/Math.max(1,maxPeriod-1)*(right-left),y=v=>bottom-(v-lo)/(hi-lo)*(bottom-top);for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4;shape(s,'line',{x1:left,x2:right,y1:y(v),y2:y(v),stroke:'#e4ebf0'});shape(s,'text',{x:left-9,y:y(v)+4,'text-anchor':'end','font-size':11,fill:'#526779'},fmt(v,m.endsWith('rate')?2:0))}for(const p of [1,10,16,20,30,31,40,45,48,50].filter(p=>p<=maxPeriod)){shape(s,'text',{x:x(p),y:301,'text-anchor':'middle','font-size':11,fill:'#526779'},p);if(p===16||p===31)shape(s,'line',{x1:x(p),x2:x(p),y1:top,y2:bottom,stroke:'#9babb9','stroke-dasharray':'5 4'})}for(const t of d.treatments){const group=rows.filter(r=>r.treatment===t).sort((a,b)=>a.period-b.period),band=group.filter(r=>valid(r.ci_low));if(band.length>1)shape(s,'polygon',{points:band.map(r=>`${x(r.period)},${y(r.ci_low)}`).concat([...band].reverse().map(r=>`${x(r.period)},${y(r.ci_high)}`)).join(' '),fill:colors[t],opacity:.12});shape(s,'polyline',{points:group.map(r=>`${x(r.period)},${y(r.mean)}`).join(' '),fill:'none',stroke:colors[t],'stroke-width':2.2});for(const r of group){const dot=shape(s,'circle',{cx:x(r.period),cy:y(r.mean),r:3,fill:colors[t]});tip(s,dot,`${names[t]} 第${r.period}轮：${fmt(r.mean)}，n=${r.n}，95% ${ci(r)}`)}}legend(s,d.treatments.map(t=>({label:names[t],color:colors[t]})),329)}
+function renderSummary(){const rows=a.treatment_summaries.filter(r=>r.stage===stage()&&r.metric===metric());bars('treatment-chart',rows.map(r=>({...r,label:names[r.treatment],color:colors[r.treatment]})));table('treatment-table',['实验','独立场次 n','均值','95% 区间','SD','中位数','Q25','Q75','最小','最大'],rows.map(r=>[names[r.treatment],r.n,fmt(r.mean),ci(r),fmt(r.sd),fmt(r.median),fmt(r.q25),fmt(r.q75),fmt(r.minimum),fmt(r.maximum)]));const findings=$('findings');findings.replaceChildren();for(const r of a.treatment_summaries.filter(r=>r.stage===stage()&&r.metric==='transfer_mean')){const positive=a.treatment_summaries.find(q=>q.stage===stage()&&q.metric==='transfer_positive_rate'&&q.treatment===r.treatment);findings.append(el('div',`${names[r.treatment]}：平均每次机会转 ${fmt(r.mean)}，正转账比例 ${pct(positive?.mean)}，重复间 SD ${fmt(r.sd)}。`,'finding'))}const bins=a.distributions.filter(r=>r.stage===stage());if(!bins.length)return empty('distribution-chart');const labels=[...new Set(bins.map(r=>r.bin))],s=svg('distribution-chart',840,310),left=50,right=815,bottom=245,top=20,max=Math.max(.05,...bins.map(r=>r.share)),groupW=(right-left)/labels.length,bw=groupW/(d.treatments.length+1);for(let i=0;i<=4;i++){const v=max*i/4,y=bottom-v/max*(bottom-top);shape(s,'line',{x1:left,x2:right,y1:y,y2:y,stroke:'#e6edf2'});shape(s,'text',{x:left-7,y:y+4,'text-anchor':'end','font-size':10},pct(v))}labels.forEach((label,i)=>{shape(s,'text',{x:left+(i+.5)*groupW,y:265,'text-anchor':'middle','font-size':10},label);d.treatments.forEach((t,j)=>{const r=bins.find(r=>r.bin===label&&r.treatment===t);if(!r)return;const n=shape(s,'rect',{x:left+i*groupW+(j+.5)*bw,y:bottom-r.share/max*(bottom-top),width:bw-2,height:r.share/max*(bottom-top),fill:colors[t]});tip(s,n,`${names[t]} ${label}: ${r.count} 场 (${pct(r.share)})`)})});legend(s,d.treatments.map(t=>({label:names[t],color:colors[t]})))}
+function renderMatrix(){const rows=a.cell_summaries.filter(r=>r.treatment===treatment()&&r.stage===stage()&&r.metric===metric()),target=$('matrix');target.replaceChildren();const head=el('tr');head.append(el('th','第一位 / 第二位'));for(const p of d.personalities)head.append(el('th',p.personality_id||p.id));target.append(head);const max=Math.max(1,...rows.filter(r=>valid(r.mean)).map(r=>r.mean));for(const p of d.personalities){const first=p.personality_id||p.id,tr=el('tr');tr.append(el('th',first));for(const q of d.personalities){const combo=first+'__'+(q.personality_id||q.id),r=rows.find(r=>r.combination_id===combo),td=el('td',fmt(r?.mean),'cell');td.tabIndex=0;td.setAttribute('role','button');td.setAttribute('aria-label',`${combo} ${metricNames[metric()]} ${fmt(r?.mean)}`);td.setAttribute('aria-selected',String(combo===selectedCombo));td.append(el('small',`n=${r?.n || 0}/${plannedByCell.get(treatment() + '/' + combo) || 0} · SD ${fmt(r?.sd)}`));if(r&&valid(r.mean))td.style.background=`rgba(33,110,170,${.04+.3*Math.max(0,r.mean)/max})`;td.title=`${combo} · 95% ${r?ci(r):'—'}`;const choose=()=>{selectedCombo=combo;renderMatrix();renderRepeat()};td.addEventListener('click',choose);td.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();choose()}});tr.append(td)}target.append(tr)}}
+function renderRepeat(){$('cell-title').textContent=`${selectedCombo} · ${stageNames[stage()]} · ${metricNames[metric()]}`;const rows=a.pair_stages.filter(r=>r.combination_id===selectedCombo&&r.stage===stage()),cells=a.cell_summaries.filter(r=>r.combination_id===selectedCombo&&r.stage===stage()&&r.metric===metric());table('repeat-table',['实验','n','均值','95% 区间','SD','中位数','Q25–Q75'],cells.map(r=>[names[r.treatment],r.n,fmt(r.mean),ci(r),fmt(r.sd),fmt(r.median),`${fmt(r.q25)}–${fmt(r.q75)}`]));
+    const byJob = new Map(rows.map(r => [r.job_id, r]));
+    const tasks = completedSessions.filter(s => s.combination_id === selectedCombo);
+    table('individual-repeats', ['实验', '重复', '该阶段结算轮数', metricNames[metric()], '单场报告'],
+        tasks.map(task => {
+            const row = byJob.get(task.job_id);
+            const link = task.run_dir ? el('a', '打开') : '—';
+            if (task.run_dir) link.href = task.run_dir + '/report.html';
+            return [names[task.treatment], task.repetition,
+                    row?.period_count ?? '—', fmt(row?.[metric()]), link];
+        }));
+    renderOrientation();
+    const points=rows.filter(r=>valid(r[metric()]));if(!points.length)return empty('repeat-chart');const s=svg('repeat-chart',1000,300),left=80,right=930,top=25,bottom=230,values=points.map(r=>r[metric()]).concat(cells.flatMap(r=>[r.ci_low,r.ci_high]).filter(valid));let lo=Math.min(0,...values),hi=Math.max(1,...values);const y=v=>bottom-(v-lo)/(hi-lo)*(bottom-top);for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4;shape(s,'line',{x1:left,x2:right,y1:y(v),y2:y(v),stroke:'#e4ebf0'});shape(s,'text',{x:left-8,y:y(v)+4,'text-anchor':'end','font-size':11},fmt(v,1))}d.treatments.forEach((t,i)=>{const x=left+(i+.5)*(right-left)/d.treatments.length,group=points.filter(r=>r.treatment===t).sort((a,b)=>a.repetition-b.repetition),c=cells.find(r=>r.treatment===t);shape(s,'text',{x,y:265,'text-anchor':'middle','font-size':13},names[t]);group.forEach((r,j)=>{const dot=shape(s,'circle',{cx:x+(j-(group.length-1)/2)*10,cy:y(r[metric()]),r:5,fill:colors[t],opacity:.65});tip(s,dot,`${r.job_id}: ${fmt(r[metric()])}`)});if(c&&valid(c.mean)){shape(s,'line',{x1:x-45,x2:x+45,y1:y(c.mean),y2:y(c.mean),stroke:colors[t],'stroke-width':3});if(valid(c.ci_low))shape(s,'line',{x1:x,x2:x,y1:y(c.ci_low),y2:y(c.ci_high),stroke:colors[t],'stroke-width':2})}});}
+function renderOrientation(){const orientation=a.orientation.filter(r=>r.treatment===treatment()&&r.stage===stage()).sort((a,b)=>Math.abs(b.estimate||0)-Math.abs(a.estimate||0));table('orientation-table',['正向','反向','n 正/反','平均转账差','95% 区间','Holm p'],orientation.map(r=>[r.forward,r.reverse,`${r.n_left}/${r.n_right}`,fmt(r.estimate),ci(r),pformat(r.p_holm)]))}
+function renderPreferences(){const rows=a.preferences.filter(r=>r.treatment===treatment()&&r.stage===stage()&&r.dimension===$('dimension').value&&r.metric===$('agent-metric').value).sort((a,b)=>{const order={low:0,medium:1,high:2};return (order[a.level]??Number(a.level.slice(1)))-(order[b.level]??Number(b.level.slice(1)))});bars('preference-chart',rows.map(r=>({...r,label:levels[r.level]||r.level})));table('preference-table',['等级 / 人格','Agent n','独立场次','均值','95% 聚类区间','Agent 间 SD'],rows.map(r=>[levels[r.level]||r.level,r.n_agents,r.n_pairs,fmt(r.mean),ci(r),fmt(r.sd)]))}
+function renderChanges(){const transition=$('transition').value,m=metric(),rows=a.phase_changes.filter(r=>r.transition===transition&&r.metric===m);bars('change-chart',rows.map(r=>({...r,label:names[r.treatment],color:colors[r.treatment]})));table('change-table',[metricNames[m]+'：后 − 前','同场配对 n','平均变化','95% 区间','变化量 SD'],rows.map(r=>[names[r.treatment],r.n,fmt(r.mean),ci(r),fmt(r.sd)]));const show=(id,rs)=>table(id,['左 − 右','n 左/右','差值','95% 区间','原始 p','Holm p'],rs.map(r=>[`${names[r.left]} − ${names[r.right]}`,`${r.n_left}/${r.n_right}`,fmt(r.estimate),ci(r),pformat(r.p_value),pformat(r.p_holm)]));show('did-table',a.contrasts.filter(r=>r.kind==='change_vs_baseline'&&r.stage===transition&&r.metric===m));show('contrast-table',a.contrasts.filter(r=>r.kind==='level'&&r.stage===stage()&&r.metric===m))}
+function renderInsurance(){const t=$('insurance-treatment').value,forced=t==='25f',m=metric();$('insurance-context').textContent=!t?'本批计划不含保险实验。':forced?`25F 为环境分配；本批概率（双方 / 仅第一位 / 仅第二位）＝${JSON.stringify(a.assignment_probabilities)}。`:'25V 为参与者自主选择，图中比例是第 16 轮购买率。';$('insurance-rate-title').textContent=forced?'各人格的环境获保率':'各人格的自主购买率';const rates=a.insurance_rates.filter(r=>r.treatment===t).sort((a,b)=>Number(a.personality_id.slice(1))-Number(b.personality_id.slice(1)));bars('insurance-rate-chart', rates.map(r => ({...r, label:r.personality_id})));
+    table('insurance-rate-table', ['人格', '有效人数', '涉及场次', forced ? '获保率' : '购买率', '95% 聚类区间'],
+          rates.map(r => [r.personality_id, r.n_agents, r.n_pairs, pct(r.mean),
+                          valid(r.ci_low) ? pct(r.ci_low) + ' – ' + pct(r.ci_high) : '—']),
+          !t ? '本批计划不含保险实验' : '尚无完整保险记录');
+    const rows=a.insurance.filter(r=>r.treatment===t&&r.stage===stage()&&r.metric===m).sort((a,b)=>Number(a.insured_count)-Number(b.insured_count));bars('insurance-group-chart',rows.map(r=>({...r,label:`${r.insured_count} 人获保 · ${metricNames[m]}`})));table('insurance-table',['第 16 轮获保人数','阶段','指标','场次 n','均值','95% 区间'],rows.map(r=>[r.insured_count,stage(),metricNames[m],r.n,fmt(r.mean),ci(r)]))}
+function renderReciprocity(){const labels={no_previous:'尚无搭档发送者历史',previous_zero:'搭档上次转 0',previous_positive:'搭档上次转正数'},rows=Object.keys(labels).map(k=>a.reciprocity.find(r=>r.treatment===treatment()&&r.stage===stage()&&r.lag_group===k)
+    || {lag_group:k, n_agents:0, n_pairs:0, eligible_opportunities:0, mean:null, ci_low:null, ci_high:null});bars('reciprocity-chart',rows.map(r=>({...r,label:labels[r.lag_group]})));table('reciprocity-table',['此前最近的搭档选择','Agent n','独立场次','符合条件的机会数','本次平均转账','95% 聚类区间'],rows.map(r=>[labels[r.lag_group],r.n_agents,r.n_pairs,r.eligible_opportunities,fmt(r.mean),ci(r)]))}
+function renderQuality() {
+    const short = d.run_mode === 'smoke';
+    const rows = short ? [] : (a.termination_distribution || []);
+    const headers = ['实验', '自然结束总场数', '轮次', '进入该轮', '本轮结束', '继续下轮',
+                     '全组占比', '条件结束率', '协议条件概率'];
+    const noRows = short ? '短程测试由预设轮数停止，自然结束分布不适用。' : '本批尚无自然结束的完整场次。';
+    table('termination-table', headers, rows.map(r =>
+        [names[r.treatment] || r.treatment, r.n_natural, r.period, r.at_risk, r.ended, r.continued,
+         pct(r.share_all), pct(r.conditional_rate), pct(r.protocol_rate)]), noRows);
+    const observed = rows.filter(r => r.treatment === treatment() && valid(r.conditional_rate));
+    if (!observed.length) {
+        empty('termination-chart', short ? noRows : '当前实验尚无自然结束的完整场次。');
+        return;
+    }
+    bars('termination-chart', observed.map(row => ({
+        label: names[row.treatment] + ' · 第 ' + row.period + ' 轮结束率（%）',
+        mean: 100 * row.conditional_rate, n: row.at_risk, color: colors[row.treatment]
+    })));
+}
+function renderJobs() {
+    const query = $('job-search').value.trim().toLowerCase();
+    const rows = completedSessions.filter(r => r.treatment === treatment() && r.job_id.toLowerCase().includes(query));
+    const size = 50;
+    const pages = Math.max(1, Math.ceil(rows.length / size));
+    page = Math.max(0, Math.min(page, pages - 1));
+    $('page-label').textContent = rows.length + ' 场 · 第 ' + (page + 1) + ' / ' + pages + ' 页';
+    $('previous-page').disabled = page === 0;
+    $('next-page').disabled = page + 1 >= pages;
+    const body = $('jobs');
+    body.replaceChildren();
+    for (const job of rows.slice(page * size, (page + 1) * size)) {
+        const tr = el('tr');
+        const members = job.first_personality_id + '=Agent ' + job.first_agent_id + '，' +
+                        job.second_personality_id + '=Agent ' + job.second_agent_id;
+        for (const value of [job.combination_id, job.repetition, job.completed_periods, members]) tr.append(el('td', value));
+        const cell = el('td');
+        if (job.run_dir) {
+            for (const [label, file] of [['报告','report.html'],['推理','reasoning_text/all_agents.txt'],['记忆','memory_text/all_agents.txt']]) {
+                const link = el('a', label + ' ');
+                link.href = job.run_dir + '/' + file;
+                cell.append(link);
+            }
+        }
+        tr.append(cell);
+        body.append(tr);
+    }
+}
+function render(){renderSummary();drawTime();renderMatrix();renderRepeat();renderPreferences();renderChanges();renderInsurance();renderReciprocity();renderQuality();renderJobs()}
+const done = completedSessions.length;$('overall').textContent=`${d.run_mode==='full_session'?'完整实验':'短程 smoke 测试'} · 完成 ${done} / 计划 ${d.sessions.length} 场 · 三个等级 × 两个偏好维度，组成九种人格`;
+for(const [value,label] of [[done,'通过完整校验的独立场次'],[a.complete_agent_instances,'完成场次中的 Agent 实例'],[new Set(d.sessions.map(s=>s.combination_id)).size,'计划的有序人格组合'],[completedSessions.reduce((total,s)=>total+s.completed_periods,0),'完整配对实验的结算总轮数']]){const card=el('div',undefined,'card');card.append(el('strong',value),el('span',label));$('overview').append(card)}
+if(d.run_mode==='smoke')$('overall').after(el('p','当前是短程测试：不应将不完整的阶段窗口解释为完整实验效果。','warn'));
+for(const p of d.personalities)$('legend').append(el('span',`${p.personality_id||p.id}：${p.label}`));
+for(const [name,file] of [['分析说明（Markdown）','analysis_summary.md'],['完整分析数据（JSON）','analysis.json'],['分析来源与文件校验','analysis_provenance.json'],['实验清单','pair_sessions.csv'],['原始逐轮数据','period_records.csv'],['组合汇总','combination_summary.csv'],['配对阶段指标','pair_stage_metrics.csv'],['个人阶段指标','agent_stage_metrics.csv'],['总体统计','treatment_statistics.csv'],['偏好分组','personality_statistics.csv'],['轮次统计','period_statistics.csv'],['阶段变化','phase_changes.csv'],['实验差异检验','treatment_contrasts.csv'],['保险场次与人数','insurance_summary.csv'],['记录覆盖明细','record_coverage.csv'],['自然结束分布','termination_distribution.csv'],['保险分组','insurance_statistics.csv'],['购买 / 获保率','insurance_rates.csv'],['互惠条件行为','reciprocity_statistics.csv'],['方向比较','orientation_comparisons.csv']]){const link=el('a',name);link.href=file;$('downloads').append(link)}
+for(const id of ['treatment','stage','metric'])$(id).addEventListener('change',()=>{page=0;render()});$('time-metric').addEventListener('change',drawTime);$('insurance-treatment').addEventListener('change',renderInsurance);for(const id of ['dimension','agent-metric'])$(id).addEventListener('change',renderPreferences);$('transition').addEventListener('change',renderChanges);$('job-search').addEventListener('input',()=>{page=0;renderJobs()});$('previous-page').addEventListener('click',()=>{page--;renderJobs()});$('next-page').addEventListener('click',()=>{page++;renderJobs()});$('cell-filter').addEventListener('click',()=>{$('job-search').value=selectedCombo;page=0;renderJobs();$('details').scrollIntoView()});$('clear-filter').addEventListener('click',()=>{$('job-search').value='';page=0;renderJobs()});render();
+</script></body></html>

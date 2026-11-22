@@ -83,7 +83,7 @@ def install_spy(monkeypatch, *, inject_canary=True):
             assert not reply.tool_calls
             content = json.loads(reply.content)
             if inject_canary:
-                content["partner_assessment"] = canary(turn[0], turn[1]["current_period"])
+                content["note"] = canary(turn[0], turn[1]["current_period"])
                 reply.content = json.dumps(content)
             record["updated_content"] = copy.deepcopy(content)
         record["tool_calls"] = [
@@ -99,14 +99,6 @@ def install_spy(monkeypatch, *, inject_canary=True):
 def assert_accepted_transfers(root):
     profiles = read_json(root / "participant_profiles.json")["profiles"]
     return check_transfers(root, profiles)
-
-
-def assert_no_transfers(root, manifest):
-    assert manifest["success"] is False
-    assert manifest["completed_periods"] == []
-    assert manifest["router_model_requests"] == 0
-    assert not any(row["action"] == "submit_decision" for row in rows(root / "agent_actions.jsonl"))
-    assert rows(root / "period_records.jsonl") == []
 
 
 def test_twenty_agents_remember_only_their_own_state_across_workspace_restoration(tmp_path, monkeypatch):
@@ -162,13 +154,14 @@ def test_twenty_agents_remember_only_their_own_state_across_workspace_restoratio
         assert not contains_key(state, {"scope_id", "preferences_sha256", "treatment", "session_id"})
         period = observation["current_period"]
         if call["update"]:
-            assert state["revision"] == period - 1
-            if period == 2:
-                assert state["content"]["partner_assessment"] == canary(agent, 1)
+            expected_revision = 1 if observation["task"] == "closing" else 0
+            assert state["revision"] == expected_revision
+            if expected_revision:
+                assert state["content"]["note"] == canary(agent, 2)
             histories[agent].append(state["revision"])
         else:
-            assert state["revision"] == period
-            assert state["content"]["partner_assessment"] == canary(agent, period)
+            assert state["revision"] == period - 1
+            assert state["content"]["note"] == (canary(agent, period) if period > 1 else "")
             if observation["task"] == "waiting":
                 assert [tool["name"] for tool in call["tool_calls"]] == ["finish"]
         for other in range(1, 21):
@@ -182,6 +175,7 @@ def test_twenty_agents_remember_only_their_own_state_across_workspace_restoratio
             call for call in spy["calls"]
             if call["update"] and call["turn"][0] == update["agent_id"]
             and call["turn"][1]["current_period"] == update["period"]
+            and call["turn"][1]["task"] == update["task"]
         ]
         assert len(matching) == 1
         call = matching[0]
@@ -197,7 +191,7 @@ def test_twenty_agents_remember_only_their_own_state_across_workspace_restoratio
         workspace = root / "agents" / f"agent_{agent:04d}"
         state = read_json(workspace / "private_memory.json")
         assert state["owner_agent_id"] == agent and state["revision"] == 2
-        assert state["content"]["partner_assessment"] == canary(agent, 2)
+        assert state["content"]["note"] == canary(agent, 2)
         assert read_json(workspace / "config.json")["enable_memory"] is False
 
 
@@ -235,7 +229,7 @@ def test_memory_tracks_insurance_tasks_and_withdrawal_without_cross_pair_informa
             assert treatment == "25V" and observation["current_period"] == 16
             assert "partner_purchase" not in observation
             assert "income_before_transfer" not in observation
-        if treatment != "baseline" and observation["current_period"] == 31:
+        if treatment != "baseline" and observation["current_period"] == 31 and observation["task"] != "closing":
             assert observation["insured"] is False
             assert "announcement" in observation
     if treatment == "25V":
@@ -280,8 +274,12 @@ def test_fenced_memory_survives_real_framework_through_period_31(tmp_path, monke
             # This is the actual provider input, after parsing, validation,
             # workspace persistence and replacement of the private note.
             assert supplied["agent_id"] == agent
-            assert supplied["content"] == latest[agent]["content"]
-            assert supplied["revision"] == latest[agent]["revision"]
+            if agent in latest:
+                assert supplied["content"] == latest[agent]["content"]
+                assert supplied["revision"] == latest[agent]["revision"]
+            else:
+                assert observation["current_period"] == 1
+                assert supplied["revision"] == 0 and supplied["content"]["note"] == ""
             if observation["task"] == "waiting":
                 assert [tool.function.name for tool in response.choices[0].message.tool_calls] == ["finish"]
             decision_calls.append((key, supplied["revision"]))
@@ -336,19 +334,17 @@ def test_fenced_memory_survives_real_framework_through_period_31(tmp_path, monke
         assert persisted["revision"] == expected["revision"]
 
 
-def test_new_version_preserves_reference_files_and_reference_runtime(tmp_path):
+def test_current_runners_preserve_sources_at_runtime_and_scripted_economics(tmp_path):
     snapshot = read_json(PROJECT_ROOT / "experiments/fixed_preferences_memory_v1/baseline_reference.json")["sha256"]
 
     def fingerprints():
         return {name: hashlib.sha256((PROJECT_ROOT / name).read_bytes()).hexdigest() for name in snapshot}
 
-    # The shared configuration loader now replaces stale framework aliases.
-    # Keep the creation snapshot for all other baseline files; neither runner
-    # may mutate any source file, including the repaired loader, at runtime.
+    # The current version was explicitly upgraded in place for native reasoning.
+    # Historical source fingerprints remain historical, not a freeze on runtime
+    # code. The paper protocol is still frozen; runs must never rewrite sources.
     before = fingerprints()
-    assert {name: digest for name, digest in before.items() if name != "custom/config.py"} == {
-        name: digest for name, digest in snapshot.items() if name != "custom/config.py"
-    }
+    assert before["protocol/paper_spec.py"] == snapshot["protocol/paper_spec.py"]
     first_root, middle_root, last_root = (tmp_path / name for name in ("reference-first", "memory", "reference-last"))
     first = reference.run_experiment(backend="scripted", completed_period_limit=2, run_dir=first_root)
     middle = version.run_experiment(backend="scripted", completed_period_limit=2, run_dir=middle_root)
@@ -391,10 +387,11 @@ def test_invalid_memory_response_cannot_produce_or_fall_back_to_an_economic_choi
 
     monkeypatch.setattr(version.ScriptedLLMClient, "call", invalid_update)
     root = tmp_path / invalid
-    manifest = version.run_experiment(backend="scripted", completed_period_limit=1, run_dir=root, request_limit=50)
-    assert_no_transfers(root, manifest)
+    manifest = version.run_experiment(backend="scripted", completed_period_limit=2, run_dir=root, request_limit=50)
+    assert manifest["success"] is False and manifest["completed_periods"] == [1]
+    assert len(assert_accepted_transfers(root)) == 2
     assert manifest["private_memory_update_requests"] == 4 * 3
-    assert manifest["private_memory_update_requests"] == manifest["participant_model_requests"]
+    assert manifest["private_memory_update_requests"] + 4 == manifest["participant_model_requests"]
     assert not rows(root / "private_memory_updates.jsonl")
     rejected = [row for row in rows(root / "run.log") if row["event"] == "private_memory_update_rejected"]
     contexts = {row["request_index"]: row for row in rows(root / "participant_contexts.jsonl")}
@@ -438,14 +435,14 @@ def test_twenty_agents_correct_new_run_schema_errors_before_deciding(tmp_path, m
         if is_memory_update(messages):
             assert not kwargs.get("tools") and not response.choices[0].message.tool_calls
             attempts[agent] += 1
-            assert supplied["revision"] == 7
+            assert supplied["revision"] == 6
             disk = read_json(root / "agents" / f"agent_{agent:04d}" / "private_memory.json")
             if agent not in prior_states:
                 prior_states[agent] = disk
             assert disk == prior_states[agent], "Rejected drafts must not change the saved note."
             content = json.loads(response.choices[0].message.content)
             if attempts[agent] == 1:
-                content["partner_assessment"] = f"REJECTED_FORMAT_ONLY_AGENT_{agent}"
+                content["note"] = f"REJECTED_FORMAT_ONLY_AGENT_{agent}"
                 if agent == 1:
                     content.update(
                         partner_id=observation["partner_id"],
@@ -460,14 +457,14 @@ def test_twenty_agents_correct_new_run_schema_errors_before_deciding(tmp_path, m
                 # The participant chooses a different valid set; the program
                 # must not silently drop the last citation or metadata itself.
                 content["evidence_periods"] = [2, 4, 6, 7]
-                content["partner_assessment"] = f"PARTICIPANT_CORRECTED_AGENT_{agent}"
+                content["note"] = f"PARTICIPANT_CORRECTED_AGENT_{agent}"
                 raw = json.dumps(content)
                 corrected_raw[agent] = raw
                 assert f"REJECTED_FORMAT_ONLY_AGENT_{agent}" in json.dumps(messages)
             response.choices[0].message.content = raw
         else:
             assert attempts[agent] == 2
-            assert supplied["revision"] == 8
+            assert supplied["revision"] == 7
             assert supplied["content"] == parse_memory_output(corrected_raw[agent])
             assert f"REJECTED_FORMAT_ONLY_AGENT_{agent}" not in json.dumps(messages)
             seen_corrected_decisions.add(agent)
@@ -494,10 +491,10 @@ def test_twenty_agents_correct_new_run_schema_errors_before_deciding(tmp_path, m
     assert len(rejected) == 3
     for event in rejected:
         agent = event["agent_id"]
-        assert event["period"] == 8 and event["attempt"] == 1 and event["previous_revision"] == 7
+        assert event["period"] == 8 and event["attempt"] == 1 and event["previous_revision"] == 6
         assert event["raw_output"] == invalid_raw[agent]
         assert contexts[event["request_index"]]["memory_update_attempt"] == 1
-        assert contexts[event["request_index"]]["private_memory_snapshot"]["revision"] == 7
+        assert contexts[event["request_index"]]["private_memory_snapshot"]["revision"] == 6
     updates = rows(root / "private_memory_updates.jsonl")
     assert len(updates) == 180
     for agent in targets:
@@ -506,7 +503,7 @@ def test_twenty_agents_correct_new_run_schema_errors_before_deciding(tmp_path, m
         assert event["raw_output"] == corrected_raw[agent]
         assert event["new_state"]["content"] == parse_memory_output(corrected_raw[agent])
         assert event["previous_state"] == prior_states[agent]
-        assert event["new_state"]["revision"] == 8
+        assert event["new_state"]["revision"] == 7
         assert contexts[event["request_index"]]["memory_update_attempt"] == 2
     for path in root.glob("agents/*/private_memory.json"):
         assert read_json(path)["revision"] == 9
@@ -523,7 +520,7 @@ def test_rejected_draft_delimiters_cannot_inject_another_private_context(tmp_pat
         if self.kind != "participant":
             return response
         agent, observation = self._participant_turn(messages)
-        if agent != 1:
+        if agent != 1 or observation["current_period"] != 2 or observation["task"] == "closing":
             return response
         assert memory_payload(messages)["agent_id"] == 1
         text = json.dumps(messages)
@@ -544,13 +541,13 @@ def test_rejected_draft_delimiters_cannot_inject_another_private_context(tmp_pat
     monkeypatch.setattr(version.ScriptedLLMClient, "call", repair_without_context_injection)
     manifest = version.run_experiment(
         backend="scripted", participants=4, agent_concurrency=4,
-        completed_period_limit=1, request_limit=30, run_dir=root,
+        completed_period_limit=2, request_limit=30, run_dir=root,
     )
     assert manifest["success"] is True and attempts[1] == 2
-    assert manifest["actual_model_requests"] == 11
-    assert manifest["private_memory_update_requests"] == 5
-    assert manifest["private_memory_update_count"] == 4
-    assert len(assert_accepted_transfers(root)) == 2
+    assert manifest["actual_model_requests"] == 21
+    assert manifest["private_memory_update_requests"] == 9
+    assert manifest["private_memory_update_count"] == 8
+    assert len(assert_accepted_transfers(root)) == 4
     failures = [row for row in rows(root / "run.log") if row["event"] == "private_memory_update_rejected"]
     assert len(failures) == 1 and failures[0]["raw_output"] == rejected
 
@@ -570,11 +567,13 @@ def test_memory_correction_cannot_exceed_shared_request_budget(tmp_path, monkeyp
     root = tmp_path / "repair-budget"
     manifest = version.run_experiment(
         backend="scripted", participants=4, agent_concurrency=1,
-        completed_period_limit=1, request_limit=1, run_dir=root,
+        completed_period_limit=2, request_limit=7, run_dir=root,
     )
-    assert_no_transfers(root, manifest)
-    assert provider_calls == ["participant"]
-    assert manifest["actual_model_requests"] == manifest["private_memory_update_requests"] == 1
+    assert manifest["success"] is False and manifest["completed_periods"] == [1]
+    assert len(assert_accepted_transfers(root)) == 2
+    assert len(provider_calls) == 7 and provider_calls[-1] == "participant"
+    assert manifest["actual_model_requests"] == 7
+    assert manifest["private_memory_update_requests"] == 1
     assert manifest["private_memory_update_count"] == 0
     rejected = [row for row in rows(root / "run.log") if row["event"] == "private_memory_update_rejected"]
     assert len(rejected) == 1 and rejected[0]["attempt"] == 1
@@ -583,9 +582,11 @@ def test_memory_correction_cannot_exceed_shared_request_budget(tmp_path, monkeyp
 
 def test_memory_provider_failure_is_not_retried_as_a_format_error(tmp_path, monkeypatch):
     provider_calls = defaultdict(int)
+    original = version.ScriptedLLMClient.call
 
     async def unavailable_provider(self, model=None, messages=None, **kwargs):
-        assert self.kind == "participant" and is_memory_update(messages)
+        if self.kind != "participant" or not is_memory_update(messages):
+            return await original(self, model=model, messages=messages, **kwargs)
         agent, observation = self._participant_turn(messages)
         provider_calls[agent] += 1
         raise ConnectionError("Simulated offline provider failure")
@@ -594,11 +595,13 @@ def test_memory_provider_failure_is_not_retried_as_a_format_error(tmp_path, monk
     root = tmp_path / "provider-failure"
     manifest = version.run_experiment(
         backend="scripted", participants=4, agent_concurrency=4,
-        completed_period_limit=1, request_limit=50, run_dir=root,
+        completed_period_limit=2, request_limit=50, run_dir=root,
     )
-    assert_no_transfers(root, manifest)
+    assert manifest["success"] is False and manifest["completed_periods"] == [1]
+    assert len(assert_accepted_transfers(root)) == 2
     assert dict(provider_calls) == {agent: 1 for agent in range(1, 5)}
-    assert manifest["actual_model_requests"] == manifest["private_memory_update_requests"] == 4
+    assert manifest["actual_model_requests"] == 10
+    assert manifest["private_memory_update_requests"] == 4
     assert manifest["private_memory_update_count"] == 0
     assert not any(row["event"] == "private_memory_update_rejected" for row in rows(root / "run.log"))
     assert all(read_json(path)["revision"] == 0 for path in root.glob("agents/*/private_memory.json"))
@@ -612,7 +615,7 @@ def test_rejected_transfer_does_not_repeat_or_replace_this_observations_memory(t
     async def malformed_choice(self, model=None, messages=None, **kwargs):
         response = await captured(self, model=model, messages=messages, **kwargs)
         turn = self._participant_turn(messages or []) if self.kind == "participant" else None
-        if turn and turn[1]["task"] == "transfer" and not is_memory_update(messages):
+        if turn and turn[1]["task"] == "transfer" and turn[1]["current_period"] == 2 and not is_memory_update(messages):
             token = turn[1]["decision_id"]
             if token not in malformed:
                 malformed.add(token)
@@ -624,16 +627,16 @@ def test_rejected_transfer_does_not_repeat_or_replace_this_observations_memory(t
     monkeypatch.setattr(version.ScriptedLLMClient, "call", malformed_choice)
     root = tmp_path / "repair"
     manifest = version.run_experiment(
-        backend="scripted", completed_period_limit=1, run_dir=root,
+        backend="scripted", completed_period_limit=2, run_dir=root,
         request_limit=50, agent_concurrency=4,
     )
     assert manifest["success"] is True
     assert len(malformed) == 2
-    assert manifest["private_memory_update_requests"] == 4
-    assert manifest["actual_model_requests"] == 12
-    assert len(rows(root / "private_memory_updates.jsonl")) == 4
-    assert len(assert_accepted_transfers(root)) == 2
-    choices = [call for call in spy["calls"] if call["kind"] == "participant" and not call["update"]]
+    assert manifest["private_memory_update_requests"] == 8
+    assert manifest["actual_model_requests"] == 22
+    assert len(rows(root / "private_memory_updates.jsonl")) == 8
+    assert len(assert_accepted_transfers(root)) == 4
+    choices = [call for call in spy["calls"] if call["kind"] == "participant" and not call["update"] and call["turn"][1]["current_period"] == 2]
     assert all(memory_payload(call["messages"])["revision"] == 1 for call in choices)
 
 
@@ -641,30 +644,30 @@ def test_failed_later_update_retains_last_valid_private_state_and_stops_new_choi
     spy = install_spy(monkeypatch)
     original = version.ScriptedLLMClient.call
 
-    async def invalid_second_period(self, model=None, messages=None, **kwargs):
+    async def invalid_later_feedback(self, model=None, messages=None, **kwargs):
         response = await original(self, model=model, messages=messages, **kwargs)
         turn = self._participant_turn(messages or []) if self.kind == "participant" else None
-        if turn and turn[1]["current_period"] == 2 and is_memory_update(messages):
+        if turn and turn[1]["current_period"] == 3 and is_memory_update(messages):
             response.choices[0].message.content = "An incomplete revision"
         return response
 
-    monkeypatch.setattr(version.ScriptedLLMClient, "call", invalid_second_period)
+    monkeypatch.setattr(version.ScriptedLLMClient, "call", invalid_later_feedback)
     root = tmp_path / "retain-previous"
     manifest = version.run_experiment(
-        backend="scripted", completed_period_limit=2, run_dir=root, request_limit=100,
+        backend="scripted", completed_period_limit=3, run_dir=root, request_limit=100,
     )
-    assert manifest["success"] is False and manifest["completed_periods"] == [1]
-    assert len(assert_accepted_transfers(root)) == 2
+    assert manifest["success"] is False and manifest["completed_periods"] == [1, 2]
+    assert len(assert_accepted_transfers(root)) == 4
     commits = rows(root / "private_memory_updates.jsonl")
     assert len(commits) == 4
     for update in commits:
         state = read_json(root / "agents" / f"agent_{update['agent_id']:04d}" / "private_memory.json")
         assert state == update["new_state"]
         assert state["revision"] == 1
-        assert state["content"]["partner_assessment"] == canary(update["agent_id"], 1)
+        assert state["content"]["note"] == canary(update["agent_id"], 2)
     assert all(
         call["update"] for call in spy["calls"]
-        if call["kind"] == "participant" and call["turn"][1]["current_period"] == 2
+        if call["kind"] == "participant" and call["turn"][1]["current_period"] == 3
     )
 
 
@@ -699,7 +702,10 @@ def test_foreign_or_tampered_persistent_state_stops_before_next_model_call(tmp_p
     )
     assert tampered and manifest["success"] is False
     assert manifest["completed_periods"] == [1]
-    assert targeted_calls == [(1, True), (1, False)]
+    assert targeted_calls == [(1, False)]
+    if field in {"foreign_file", "owner_agent_id"}:
+        assert manifest["memory_report_error"]
+        assert manifest["stop_reason"] == "agent_error"
     assert not any(
         row["action"] == "submit_decision" and row["agent_id"] == 1
         and (row.get("environment_receipt") or {}).get("period") == 2
@@ -710,13 +716,14 @@ def test_foreign_or_tampered_persistent_state_stops_before_next_model_call(tmp_p
 def test_memory_updates_consume_the_shared_request_budget_without_action_fallback(tmp_path):
     root = tmp_path / "budget"
     manifest = version.run_experiment(
-        backend="scripted", completed_period_limit=1, request_limit=1,
+        backend="scripted", completed_period_limit=2, request_limit=7,
         agent_concurrency=1, run_dir=root,
     )
-    assert_no_transfers(root, manifest)
-    assert manifest["actual_model_requests"] == 1
+    assert manifest["success"] is False and manifest["completed_periods"] == [1]
+    assert len(assert_accepted_transfers(root)) == 2
+    assert manifest["actual_model_requests"] == 7
     assert manifest["private_memory_update_requests"] == 1
-    assert manifest["participant_model_requests"] == 1
+    assert manifest["participant_model_requests"] == 5
 
 
 def test_router_cannot_request_memory_updates_or_modify_participant_amounts(tmp_path, monkeypatch):
@@ -761,11 +768,11 @@ def test_participant_can_read_its_own_memory_and_choose_distinct_accepted_amount
         turn = self._participant_turn(messages or []) if self.kind == "participant" else None
         if turn and is_memory_update(messages):
             content = json.loads(response.choices[0].message.content)
-            content["expected_partner_transfer"] = {"amount": 20 + 9 * turn[0], "confidence": "low"}
+            content["note"] = f"My own fixture reference is {20 + 9 * turn[0]}."
             response.choices[0].message.content = json.dumps(content)
-        elif turn and turn[1]["task"] == "transfer":
+        elif turn and turn[1]["task"] == "transfer" and turn[1]["current_period"] == 2:
             state = memory_payload(messages)
-            amount = state["content"]["expected_partner_transfer"]["amount"] + 3
+            amount = int(state["content"]["note"].rsplit(" ", 1)[1].rstrip(".")) + 3
             chosen[turn[0]] = amount
             response.choices[0].message.tool_calls[0].function.arguments = json.dumps({
                 "instruction": f"This is my fixture choice.\ndecision_type: transfer\ndecision_id: {turn[1]['decision_id']}\namount: {amount}",
@@ -775,26 +782,32 @@ def test_participant_can_read_its_own_memory_and_choose_distinct_accepted_amount
 
     monkeypatch.setattr(version.ScriptedLLMClient, "call", memory_dependent_fixture)
     root = tmp_path / "read-memory"
-    manifest = version.run_experiment(backend="scripted", completed_period_limit=1, run_dir=root)
+    manifest = version.run_experiment(backend="scripted", completed_period_limit=2, run_dir=root)
     assert manifest["success"] is True
-    transfers = assert_accepted_transfers(root)
+    transfers = [row for row in rows(root / "agent_actions.jsonl")
+                 if row["action"] == "submit_decision" and row["ok"]
+                 and row["environment_receipt"]["period"] == 2]
     assert len(transfers) == len(chosen) == 2
     assert len(set(chosen.values())) == 2
     assert {row["agent_id"]: row["environment_receipt"]["amount"] for row in transfers} == chosen
+    assert all(row["decision_source"] == "participant_model" for row in transfers)
+    assert all(row["submitted_amount"] == row["participant_model_output"]["amount"]
+               == row["environment_receipt"]["amount"] for row in transfers)
+    assert all(row["private_memory_revision"] == 1 for row in transfers)
 
 
 def test_optional_deliberation_sees_updated_memory_without_reupdating_it(tmp_path, monkeypatch):
     spy = install_spy(monkeypatch)
     root = tmp_path / "deliberation"
     manifest = version.run_experiment(
-        backend="scripted", completed_period_limit=1, participant_deliberation=True,
+        backend="scripted", completed_period_limit=2, participant_deliberation=True,
         run_dir=root, request_limit=50,
     )
     assert manifest["success"] is True
-    assert manifest["private_memory_update_requests"] == 4
-    assert manifest["participant_deliberation_requests"] == 2
-    assert manifest["actual_model_requests"] == 12
+    assert manifest["private_memory_update_requests"] == 8
+    assert manifest["participant_deliberation_requests"] == 4
+    assert manifest["actual_model_requests"] == 24
     reviews = [call for call in spy["calls"] if call["deliberation"]]
-    assert len(reviews) == 2
-    assert all(memory_payload(call["messages"])["revision"] == 1 for call in reviews)
-    assert len(assert_accepted_transfers(root)) == 2
+    assert len(reviews) == 4
+    assert all(memory_payload(call["messages"])["revision"] == call["turn"][1]["current_period"] - 1 for call in reviews)
+    assert len(assert_accepted_transfers(root)) == 4

@@ -159,8 +159,8 @@ def test_scripted_runner_uses_real_agent_router_adapter_and_is_bounded(tmp_path,
     log_path = run_dir / "run.log"
     log_rows = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
     assert log_rows[0]["event"] == "run_started"
-    assert log_rows[-1]["event"] == "run_finished"
-    assert log_rows[-1]["success"] is True
+    assert any(row["event"] == "run_finished" and row["success"] is True for row in log_rows)
+    assert log_rows[-1]["event"] == "reasoning_export_finished"
     calls = [row for row in log_rows if row["event"] == "model_call_finished"]
     assert len(calls) == manifest["actual_model_requests"]
     assert {row["agent_id"] for row in calls} == {1, 2, 3, 4}
@@ -422,7 +422,8 @@ def test_visual_report_failure_does_not_change_completed_experiment(tmp_path, mo
     assert "[打开交互图表报告]" not in summary
     logs = [json.loads(line) for line in (root / "run.log").read_text().splitlines()]
     assert any(row["event"] == "visual_report_failed" for row in logs)
-    assert logs[-1]["event"] == "run_finished" and logs[-1]["success"] is True
+    assert any(row["event"] == "run_finished" and row["success"] is True for row in logs)
+    assert logs[-1]["event"] == "reasoning_export_finished"
 
 
 @pytest.mark.parametrize("failure", ["invalid_json", "missing_amount", "ambiguous_amount", "out_of_range"])

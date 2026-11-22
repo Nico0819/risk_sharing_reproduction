@@ -320,7 +320,9 @@ def test_review_respects_token_and_request_budgets_without_cached_tools(output_l
     ))
     assert len(inner.requests) == budget.calls == wrapped.actual_calls == wrapped.deliberation_calls == 1
     request = inner.requests[0]
-    assert request["max_output_tokens"] == min(output_limit, 512)
+    # Visible review text remains short, but native reasoning shares this
+    # budget; the former 512-token cap must not override the run's limit.
+    assert request["max_output_tokens"] == output_limit
     assert "participant_phase" not in request
     assert not request.get("tools")
     assert request.get("tool_choice") in (None, "none")

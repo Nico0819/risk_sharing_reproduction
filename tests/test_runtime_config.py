@@ -28,6 +28,14 @@ ALIASES = {
 }
 THINKING_NAMES = ("AGENTSOCIETY_LLM_THINKING", "AGENTSOCIETY_CODER_LLM_THINKING")
 BODY_NAMES = ("AGENTSOCIETY_LLM_EXTRA_BODY", "AGENTSOCIETY_CODER_LLM_EXTRA_BODY")
+EFFORT_NAMES = ("AGENTSOCIETY_LLM_REASONING_EFFORT", "AGENTSOCIETY_CODER_LLM_REASONING_EFFORT")
+ROLE_SETTINGS = {
+    "AGENTSOCIETY_LLM_THINKING": "on",
+    "AGENTSOCIETY_LLM_EXTRA_BODY": '{"thinking":{"type":"enabled"}}',
+    "AGENTSOCIETY_CODER_LLM_THINKING": "off",
+    "AGENTSOCIETY_CODER_LLM_EXTRA_BODY": '{"thinking":{"type":"disabled"}}',
+    **{name: "" for name in EFFORT_NAMES},
+}
 
 
 @pytest.fixture(autouse=True)
@@ -36,11 +44,11 @@ def isolated_runtime(monkeypatch):
 
     framework = sys.modules.get("agentsociety2.config.config")
     if framework is not None:
-        for alias in ALIASES:
+        for alias in (*ALIASES, *ROLE_SETTINGS):
             attribute = alias.removeprefix("AGENTSOCIETY_")
             monkeypatch.setattr(framework.Config, attribute, getattr(framework.Config, attribute))
     for name in (
-        *PROJECT_VALUES, *ALIASES, *THINKING_NAMES, *BODY_NAMES,
+        *PROJECT_VALUES, *ALIASES, *ROLE_SETTINGS,
         "AGENTSOCIETY_LLM_REQUEST_TIMEOUT",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -78,6 +86,11 @@ def test_project_config_replaces_stale_framework_aliases_without_exposing_keys(t
     assert config.base_url == PROJECT_VALUES["LLM_BASE_URL"]
     assert config.model == PROJECT_VALUES["LLM_MODEL"]
     assert config.safe_status()["api_key"] == "configured"
+    assert config.thinking_disabled is False
+    assert config.router_thinking_disabled is True
+    assert config.safe_status()["thinking"] == "enabled"
+    assert config.safe_status()["participant_thinking"] == "enabled"
+    assert config.safe_status()["router_thinking"] == "disabled"
     output = capsys.readouterr()
     diagnostics = output.out + output.err + repr(config) + json.dumps(config.safe_status())
     assert PROJECT_VALUES["LLM_API_KEY"] not in diagnostics
@@ -161,30 +174,50 @@ def test_scripted_constructor_defaults_do_not_block_a_later_llm_configuration(tm
     assert config.backend == "llm"
 
 
-@pytest.mark.parametrize(
-    "name,value,message",
-    [(name, "on", "thinking must be disabled") for name in THINKING_NAMES]
-    + [(name, '{"thinking":{"type":"enabled"}}', "conflicting thinking payload") for name in BODY_NAMES],
-)
-def test_invalid_thinking_configuration_rejects_before_alias_mutation(tmp_path, monkeypatch, name, value, message):
-    old = stale_aliases(monkeypatch)
-    monkeypatch.setenv(name, value)
+@pytest.mark.parametrize("old_mode", ["off", "on", "unrelated-old-setting"])
+def test_project_assigns_distinct_role_modes_despite_stale_aliases(tmp_path, monkeypatch, old_mode):
+    stale_aliases(monkeypatch)
+    for name in THINKING_NAMES:
+        monkeypatch.setenv(name, old_mode)
+    for name in BODY_NAMES:
+        monkeypatch.setenv(name, "old non-JSON body that must not reach the provider")
+    for name in EFFORT_NAMES:
+        monkeypatch.setenv(name, "none")
+    path = write_env(tmp_path)
+    before = path.read_bytes()
 
-    with pytest.raises(RuntimeConfigError, match=message):
-        load_runtime_config("llm", env_path=write_env(tmp_path))
+    load_runtime_config("llm", env_path=path)
 
-    assert {alias: os.environ[alias] for alias in ALIASES} == old
-    assert os.environ[name] == value
+    assert_aliases()
+    assert {name: os.environ.get(name) for name in ROLE_SETTINGS} == ROLE_SETTINGS
+    assert path.read_bytes() == before
+
+
+def test_missing_credentials_do_not_partially_change_thinking_modes(tmp_path, monkeypatch):
+    stale = {name: "fake-old-value" for name in ROLE_SETTINGS}
+    for name, value in stale.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeConfigError, match="missing or placeholder"):
+        load_runtime_config("llm", env_path=write_env(tmp_path, {}))
+
+    assert {name: os.environ.get(name) for name in ROLE_SETTINGS} == stale
 
 
 def test_scripted_mode_continues_to_preserve_existing_framework_aliases(tmp_path, monkeypatch):
     old = stale_aliases(monkeypatch)
+    old_thinking = {name: "fake-old-value" for name in ROLE_SETTINGS}
+    for name, value in old_thinking.items():
+        monkeypatch.setenv(name, value)
 
     config = load_runtime_config("scripted", env_path=write_env(tmp_path, {}))
 
     assert {name: os.environ[name] for name in ALIASES} == old
+    assert {name: os.environ[name] for name in ROLE_SETTINGS} == old_thinking
     assert config.backend == "scripted"
     assert config.api_key == ""
+    assert config.safe_status()["participant_thinking"] == "disabled"
+    assert config.safe_status()["router_thinking"] == "disabled"
 
 
 @pytest.mark.parametrize("role", ["default", "coder"])
@@ -216,7 +249,7 @@ def test_existing_framework_config_is_refreshed_before_building_real_client(tmp_
 
     # Model a framework imported earlier with a different configuration. Use
     # monkeypatch so every cached class attribute is restored after this test.
-    for alias in ALIASES:
+    for alias in (*ALIASES, *ROLE_SETTINGS):
         monkeypatch.setattr(Config, alias.removeprefix("AGENTSOCIETY_"), "fake-cached-old-value")
     stale_aliases(monkeypatch)
 
@@ -228,5 +261,9 @@ def test_existing_framework_config_is_refreshed_before_building_real_client(tmp_
     ) == tuple(PROJECT_VALUES.values())
     assert connection_matches, "The constructed client must use the fictional project settings"
     assert client.model_type == role
-    assert client.thinking.policy == "off"
+    expected_state = "enabled" if role == "default" else "disabled"
+    assert client.thinking.policy == ("on" if role == "default" else "off")
+    assert client.thinking.request_kwargs() == {"extra_body": {"thinking": {"type": expected_state}}}
+    for alias, value in ROLE_SETTINGS.items():
+        assert getattr(Config, alias.removeprefix("AGENTSOCIETY_")) == value
     assert client._router is None
